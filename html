@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="theme-color" content="#1e3c72">
+    <title>IMFS Business Messaging Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://imfs.crm4.dynamics.com/WebResources/new_css_wp_3">
+</head>
+<body>
+    <div class="whatsapp-container" id="mainContainer">
+        <!-- SIDEBAR -->
+        <div class="sidebar" id="sidebar">
+            <!-- Header -->
+            <div class="sidebar-header">
+                <h4><i class="fas fa-comments me-2"></i>IMFS Business</h4>
+                <div class="header-actions">
+                    <div class="background-refresh-indicator" id="backgroundRefreshIndicator"></div>
+                    <button class="header-btn" id="settingsBtn" title="Setări">
+                        <i class="fas fa-cog"></i>
+                    </button>
+                    <button class="header-btn" id="refreshBtn" title="Reîmprospătează">
+                        <i class="fas fa-sync-alt"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Agent Dashboard Header - Pliabil -->
+            <div class="agent-dashboard-header" id="agentDashboardHeader">
+                <div class="stats-toggle-container">
+                    <button class="stats-toggle-btn" id="statsToggleBtn">
+                        <span>Statistici Generale</span>
+                        <i class="fas fa-chevron-down"></i>
+                    </button>
+                </div>
+                <div class="agent-stats collapsible" id="agentStatsContainer">
+                    <div class="stat-item" title="Conversații active atribuite">
+                        <span class="stat-value" id="statMyActive">0</span>
+                        <span class="stat-label">Active</span>
+                    </div>
+                    <div class="stat-item" title="Conversații cu mesaje necitite">
+                        <span class="stat-value" id="statMyUnread">0</span>
+                        <span class="stat-label">Necitite</span>
+                    </div>
+                    <div class="stat-item" title="Conversații noi, neatribuite">
+                        <span class="stat-value" id="statAvailable">0</span>
+                        <span class="stat-label">Disponibile</span>
+                    </div>
+                    <div class="stat-item" title="Conversații finalizate astăzi">
+                        <span class="stat-value" id="statCompletedToday">0</span>
+                        <span class="stat-label">Finalizate Azi</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Noul View Mode Toggle -->
+            <div class="view-mode-toggle-container">
+                <div class="view-mode-segment active" data-view="my-conversations">
+                    <i class="fas fa-user"></i>
+                    <span>Ale Mele</span>
+                </div>
+                <div class="view-mode-segment" data-view="available">
+                    <i class="fas fa-inbox"></i>
+                    <span>Disponibile</span>
+                </div>
+                <div class="view-mode-segment" data-view="all" style="display: none;">
+                    <i class="fas fa-globe"></i>
+                    <span>Toate</span>
+                </div>
+            </div>
+
+
+            <!-- Filters & Search -->
+            <div class="filters-section">
+                <div class="search-container">
+                    <i class="fas fa-search search-icon"></i>
+                    <input type="text" class="search-input" id="searchInput" 
+                           placeholder="Caută conversații..." 
+                           autocomplete="off" 
+                           autocorrect="off" 
+                           autocapitalize="off" 
+                           spellcheck="false">
+                    <button class="clear-search" id="clearSearch" title="Șterge căutarea">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                
+                <!-- Primary Filters -->
+                <div class="filter-tabs">
+                    <div class="filter-tab active" data-filter="all">
+                        <i class="fas fa-comment me-1"></i>Toate
+                    </div>
+                    <div class="filter-tab" data-filter="unread">
+                        <i class="fas fa-envelope me-1"></i>Necitite
+                    </div>
+                    <div class="filter-tab" data-filter="priority">
+                        <i class="fas fa-star me-1"></i>Prioritare
+                    </div>
+                    <div class="filter-tab" data-filter="archived">
+                        <i class="fas fa-archive me-1"></i>Arhivate
+                    </div>
+                </div>
+
+                <!-- Status Filters Dropdown -->
+                <div class="status-dropdown-container">
+                    <button class="dropdown-toggle status-dropdown-button" id="statusDropdownButton">
+                        <i class="fas fa-layer-group me-1"></i>
+                        <span class="status-dropdown-text">Toate statusurile</span>
+                        <i class="fas fa-chevron-down ms-1"></i>
+                    </button>
+                    <div class="status-dropdown-menu" id="statusFilterDropdown"></div>
+                </div>
+                <!-- Agent Filter Dropdown (doar pentru admini) -->
+                <div class="agent-filter-dropdown-container d-none" id="agentFilterDropdownContainer">
+                    <button class="dropdown-toggle status-dropdown-button" id="agentFilterDropdownButton">
+                        <i class="fas fa-user-friends me-1"></i>
+                        <span class="agent-filter-dropdown-text">Toți agenții</span>
+                        <i class="fas fa-chevron-down ms-1"></i>
+                    </button>
+                    <div class="status-dropdown-menu" id="agentFilterDropdown"></div>
+                </div>
+            </div>
+
+            <!-- Conversations List -->
+            <div class="conversations-list-container">
+                <div class="conversations-list" id="conversationsList">
+                    <div class="loading-state">
+                        <div class="spinner-border text-primary" role="status">
+                            <span class="visually-hidden">Se încarcă...</span>
+                        </div>
+                        <p>Se încarcă conversațiile...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- CHAT AREA -->
+        <div class="chat-area" id="chatArea">
+            <!-- Chat Header -->
+            <div class="chat-header d-none" id="chatHeader">
+                <div class="chat-header-left">
+                    <button class="mobile-back-btn mobile-only" id="mobileBackBtn" title="Înapoi la conversații">
+                        <i class="fas fa-arrow-left"></i>
+                    </button>
+                    <div class="client-avatar" id="clientAvatar">JD</div>
+                    <div class="client-info">
+                        <h5 id="clientName">John Doe</h5>
+                        <p class="client-status" id="clientStatus">
+                            <span id="statusText">Activ acum</span>
+                            <span class="status-badge-header" id="statusBadge"></span>
+                        </p>
+                        <div class="business-unit-owner-info" id="businessUnitOwnerInfo">
+                            <span id="businessUnitText"></span>
+                            <span id="ownerText"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="chat-actions">
+                    <div class="agent-dropdown">
+                        <button class="chat-action-btn" id="agentBtn" title="Atribuie agent">
+                            <i class="fas fa-user-plus"></i>
+                        </button>
+                        <div class="agent-dropdown-content" id="agentDropdown"></div>
+                    </div>
+                    <div class="status-dropdown">
+                        <button class="chat-action-btn" id="statusBtn" title="Schimbă statusul">
+                            <i class="fas fa-tag"></i>
+                        </button>
+                        <div class="status-dropdown-content" id="statusDropdown">
+                            <div class="status-dropdown-item" data-status="standby">
+                                <div class="status-color-dot standby"></div>
+                                Standby
+                            </div>
+                            <div class="status-dropdown-item" data-status="eligible">
+                                <div class="status-color-dot eligible"></div>
+                                Eligible
+                            </div>
+                            <div class="status-dropdown-item" data-status="asignat-la-superior">
+                                <div class="status-color-dot asignat-la-superior"></div>
+                                Asignat la Superior
+                            </div>
+                            <div class="status-dropdown-item" data-status="rejected">
+                                <div class="status-color-dot rejected"></div>
+                                Rejected
+                            </div>
+                            <div class="status-dropdown-item" data-status="in-executare">
+                                <div class="status-color-dot in-executare"></div>
+                                In Executare
+                            </div>
+                            <div class="status-dropdown-item" data-status="nu-raspunde">
+                                <div class="status-color-dot nu-raspunde"></div>
+                                Nu Raspunde
+                            </div>
+                            <div class="status-dropdown-item" data-status="de-revenit">
+                                <div class="status-color-dot de-revenit"></div>
+                                De Revenit
+                            </div>
+                            <div class="status-dropdown-item" data-status="contract">
+                                <div class="status-color-dot contract"></div>
+                                Contract
+                            </div>
+                            <div class="status-dropdown-item" data-status="test">
+                                <div class="status-color-dot test"></div>
+                                Test
+                            </div>
+                            <div class="status-dropdown-item" data-status="dezinteresati">
+                                <div class="status-color-dot dezinteresati"></div>
+                                Dezinteresati
+                            </div>
+                            <div class="status-dropdown-item" data-status="client-nou">
+                                <div class="status-color-dot client-nou"></div>
+                                Client nou
+                            </div>
+                        </div>
+                    </div>
+                    <button class="chat-action-btn" id="infoBtn" title="Informații client">
+                        <i class="fas fa-info-circle"></i>
+                    </button>
+                    <button class="chat-action-btn d-none d-md-block" id="moreBtn" title="Mai multe opțiuni">
+                        <i class="fas fa-ellipsis-v"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Messages Container -->
+            <div class="messages-container" id="messagesContainer">
+                <div class="empty-state">
+                    <i class="fas fa-comments"></i>
+                    <h3>Business Messaging Dashboard</h3>
+                    <p>Selectează o conversație pentru a începe să trimiți mesaje</p>
+                </div>
+            </div>
+
+            <!-- Input Area -->
+            <div class="input-area d-none" id="inputArea">
+                <!-- Quick Actions -->
+                <div class="quick-actions">
+                    <div class="quick-action" data-message="Bună ziua! Cu ce vă pot ajuta?">
+                        👋 Salut
+                    </div>
+                    <div class="quick-action" data-message="Vă mulțumesc pentru mesaj. Vă voi răspunde în curând.">
+                        🙏 Mulțumesc
+                    </div>
+                    <div class="quick-action" data-message="Aveți nevoie de mai multe informații?">
+                        ❓ Mai multe detalii
+                    </div>
+                    <div class="quick-action" data-message="Vă voi contacta telefonic în scurt timp.">
+                        📞 Vă sun
+                    </div>
+                    <div class="quick-action" data-message="Vă trimit documentele necesare.">
+                        📄 Documente
+                    </div>
+                </div>
+
+                <!-- Message Input -->
+                <div class="input-container">
+                    <textarea class="message-input" id="messageInput" 
+                              placeholder="Scrie un mesaj..." 
+                              rows="1"
+                              autocomplete="off" 
+                              autocorrect="on" 
+                              autocapitalize="sentences" 
+                              spellcheck="true"></textarea>
+                    <div class="input-actions">
+                        <button class="input-btn" id="templateBtn" title="Trimite template">
+                            <i class="fas fa-envelope-open-text"></i>
+                        </button>
+                        <button class="input-btn" id="sendBtn" title="Trimite mesaj" disabled>
+                            <i class="fas fa-paper-plane"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Info Panel - ACTUALIZAT -->
+    <div class="info-panel" id="clientInfoPanel">
+        <div class="info-panel-header">
+            <h4>Informații Client</h4>
+            <button class="info-panel-close" id="closeInfoPanel" title="Închide panoul de informații">
+                <i class="fas fa-times"></i>
+            </button>
+        </div>
+        <div class="info-panel-content" id="infoPanelContent">
+            <!-- Conținutul va fi generat dinamic de JavaScript -->
+        </div>
+    </div>
+
+    <!-- Context Menu -->
+    <div class="context-menu" id="contextMenu">
+        <div class="context-menu-item" data-action="reply">
+            <i class="fas fa-reply me-2"></i>Răspunde
+        </div>
+        <div class="context-menu-item" data-action="change-status">
+            <i class="fas fa-tag me-2"></i>Schimbă statusul
+        </div>
+        <div class="context-menu-item" data-action="transfer">
+            <i class="fas fa-exchange-alt me-2"></i>Transferă conversația
+        </div>
+        <div class="context-menu-item" data-action="archive">
+            <i class="fas fa-archive me-2"></i>Arhivează
+        </div>
+        <div class="context-menu-item danger" data-action="delete">
+            <i class="fas fa-trash me-2"></i>Șterge conversația
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div class="modal" id="settingsModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5>Setări Business Messaging</h5>
+                <button class="close-button" id="closeModal" title="Închide setări">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label">Notificări desktop</label>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="desktopNotifications">
+                        <label class="form-check-label" for="desktopNotifications">
+                            Activează notificările pentru mesaje noi
+                        </label>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Sunete</label>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="soundNotifications">
+                        <label class="form-check-label" for="soundNotifications">
+                            Redă sunet la mesaje noi
+                        </label>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Mod întunecat</label>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="darkModeToggle">
+                        <label class="form-check-label" for="darkModeToggle">
+                            Activează modul întunecat
+                        </label>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Actualizare automată (secunde)</label>
+                    <select class="form-select" id="refreshInterval" title="Alege intervalul de actualizare automată">
+                        <option value="5">5 secunde</option>
+                        <option value="10">10 secunde</option>
+                        <option value="15" selected>15 secunde</option>
+                        <option value="30">30 secunde</option>
+                        <option value="60">60 secunde</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Verificare mesaje noi (secunde)</label>
+                    <select class="form-select" id="messageCheckInterval" title="Alege intervalul de verificare mesaje noi">
+                        <option value="3">3 secunde</option>
+                        <option value="5" selected>5 secunde</option>
+                        <option value="10">10 secunde</option>
+                        <option value="15">15 secunde</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Preluare automată conversații noi</label>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="autoClaimNew">
+                        <label class="form-check-label" for="autoClaimNew">
+                            Preia automat conversațiile neatribuite
+                        </label>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Limită conversații active</label>
+                    <input type="number" class="form-control" id="maxActiveConversations" 
+                           value="20" min="1" max="50" placeholder="Număr maxim" title="Număr maxim de conversații active">
+                    <small class="form-text text-muted">
+                        Numărul maxim de conversații active simultan
+                    </small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="cancelSettings">Anulează</button>
+                <button class="btn btn-primary" id="saveSettings">Salvează</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Lightbox pentru previzualizare imagini -->
+    <div id="imageLightbox" style="display: none;">
+        <div class="lightbox-content">
+            <button id="closeLightbox" class="lightbox-close">&times;</button>
+            <div class="lightbox-loading">
+                <div class="spinner-border text-light" role="status">
+                    <span class="visually-hidden">Se încarcă...</span>
+                </div>
+            </div>
+            <img id="lightboxImage" class="lightbox-image" style="display: none;">
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/locale/ro.js"></script>
+    <script src="https://imfs.crm4.dynamics.com/WebResources/new_js_wp_3"></script>
+    <script>
+    // Logica dark mode a fost mutată în fisier 1.js pentru separare corectă
+    </script>
+</body>
+</html>
