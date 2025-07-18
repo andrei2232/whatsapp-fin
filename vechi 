@@ -1,0 +1,3595 @@
+// Configurație API - UPDATED
+const API_CONFIG = {
+    sendMessage: "https://prod-56.northeurope.logic.azure.com:443/workflows/f5d9b06f30b44c5baf84d32c7bdaa829/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=9vBMtmwPhzriKt6gnVjfTvd9aCI5E-oGDqwzkhUhMPU",
+    sendTemplateMessageUrl: "https://prod-29.northeurope.logic.azure.com:443/workflows/3f95b591c2f24563a48b0e28ee08703f/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=UCl9ofQ72azg1rx_GycOZxzXXwE5DNG_twpJ-qbYiko",
+    refreshInterval: 15000,
+    messageCheckInterval: 5000, // Interval pentru verificarea mesajelor noi
+    TOP_MESSAGE_RECORDS_TO_FETCH: 5000
+};
+
+// Lead Status Mapping
+const LEAD_STATUS_MAPPING = {
+    '100000002': 'standby',
+    '100000006': 'eligible',
+    '100000004': 'asignat-la-superior',
+    '100000003': 'rejected',
+    '100000007': 'in-executare',
+    '100000008': 'nu-raspunde',
+    '100000010': 'de-revenit',
+    '100000011': 'contract',
+    '100000012': 'test',
+    '100000013': 'dezinteresati',
+    '100000001': 'client-nou'
+};
+
+const LEAD_STATUS_LABELS = {
+    'standby': 'Standby',
+    'eligible': 'Eligible',
+    'asignat-la-superior': 'Asignat la Superior',
+    'rejected': 'Rejected',
+    'in-executare': 'In Executare',
+    'nu-raspunde': 'Nu Raspunde',
+    'de-revenit': 'De Revenit',
+    'contract': 'Contract',
+    'test': 'Test',
+    'dezinteresati': 'Dezinteresati',
+    'client-nou': 'Client nou'
+};
+
+// Direction mapping for messages
+const DIRECTION_MAPPING = {
+    'incoming': 1,
+    'outgoing': 2
+};
+
+// DEFINE THESE VARIABLES FIRST
+let AGENTS = [];
+let CURRENT_USER = null;
+
+// Function to get current user from Dynamics 365
+async function getCurrentUser() {
+    try {
+        if (window.parent?.Xrm?.Utility?.getGlobalContext) {
+            const globalContext = window.parent.Xrm.Utility.getGlobalContext();
+            const userSettings = globalContext.userSettings;
+            
+            CURRENT_USER = {
+                id: userSettings.userId.replace(/[{}]/g, ''),
+                name: userSettings.userName,
+                email: userSettings.userEmail || '',
+                initials: Utils.getInitials(userSettings.userName)
+            };
+            
+            console.log('👤 Current user loaded:', CURRENT_USER);
+            return CURRENT_USER;
+        }
+    } catch (error) {
+        console.error('Eroare la obținerea utilizatorului curent:', error);
+    }
+    
+    // Fallback pentru dezvoltare
+    CURRENT_USER = {
+        id: 'current-user-id',
+        name: 'Utilizator Curent',
+        email: 'user@imfs.ro',
+        initials: 'UC'
+    };
+    return CURRENT_USER;
+}
+
+// Function to load available agents from Dynamics 365
+async function loadAvailableAgents() {
+    try {
+        if (!window.parent?.Xrm?.WebApi) {
+            throw new Error('Xrm.WebApi nu este disponibil');
+        }
+        const userFetchXml = `
+            <fetch version="1.0" output-format="xml-platform" mapping="logical" top="50">
+                <entity name="systemuser">
+                    <attribute name="systemuserid" />
+                    <attribute name="fullname" />
+                    <attribute name="internalemailaddress" />
+                    <filter type="and">
+                        <condition attribute="isdisabled" operator="eq" value="false" />
+                        <condition attribute="accessmode" operator="eq" value="0" />
+                    </filter>
+                    <order attribute="fullname" ascending="true" />
+                </entity>
+            </fetch>`;
+        const result = await window.parent.Xrm.WebApi.retrieveMultipleRecords(
+            "systemuser", 
+            "?fetchXml=" + encodeURIComponent(userFetchXml)
+        );
+        AGENTS.length = 0;
+        result.entities.forEach(user => {
+            AGENTS.push({
+                id: user.systemuserid,
+                name: user.fullname || 'Nume necunoscut',
+                email: user.internalemailaddress || '',
+                status: 'online',
+                initials: Utils.getInitials(user.fullname || 'NN')
+            });
+        });
+        console.log(`👥 ${AGENTS.length} agenți încărcați din Dynamics 365`);
+        
+        if (AGENTS.length === 0) {
+            console.warn('Nu s-au încărcat agenți din Dynamics. Se folosește fallback.');
+            AGENTS.push(
+                { id: 'agent1', name: 'Ana Popescu', email: 'ana.popescu@imfs.ro', status: 'online', initials: 'AP' },
+                { id: 'agent2', name: 'Mihai Ionescu', email: 'mihai.ionescu@imfs.ro', status: 'online', initials: 'MI' },
+                { id: 'agent3', name: 'Elena Georgescu', email: 'elena.georgescu@imfs.ro', status: 'busy', initials: 'EG' }
+            );
+        }
+        return AGENTS;
+    } catch (error) {
+        console.error('Eroare la încărcarea agenților:', error);
+        // Fallback pentru dezvoltare
+        AGENTS.length = 0;
+        AGENTS.push(
+            { id: 'agent1', name: 'Ana Popescu', email: 'ana.popescu@imfs.ro', status: 'online', initials: 'AP' },
+            { id: 'agent2', name: 'Mihai Ionescu', email: 'mihai.ionescu@imfs.ro', status: 'online', initials: 'MI' },
+            { id: 'agent3', name: 'Elena Georgescu', email: 'elena.georgescu@imfs.ro', status: 'busy', initials: 'EG' }
+        );
+        return AGENTS;
+    }
+}
+
+// State Management
+class WhatsAppState {
+    constructor() {
+        this.conversations = [];
+        this.messages = {};
+        this.currentConversation = null;
+        this.filters = {
+            search: '',
+            category: 'all',
+            leadCategory: 'all',
+            agent: 'all'
+        };
+        this.settings = {
+            notifications: true,
+            sounds: true,
+            refreshInterval: 15000,
+            messageCheckInterval: 5000
+        };
+        this.agents = [];
+        this.currentUser = null;
+        this.pagination = {
+            currentPage: 1,
+            pageSize: 20,
+            hasMore: true,
+            isLoading: false,
+            totalLoaded: 0
+        };
+        this.lastMessageCheck = new Date(Date.now() - 60000).toISOString(); // Ultima verificare acum 1 minut
+        this.loadSettings();
+    }
+
+    loadSettings() {
+        const saved = localStorage.getItem('whatsapp_settings');
+        if (saved) {
+            this.settings = { ...this.settings, ...JSON.parse(saved) };
+        }
+    }
+
+    saveSettings() {
+        localStorage.setItem('whatsapp_settings', JSON.stringify(this.settings));
+    }
+}
+
+// Utility Functions
+const Utils = {
+    debounce(func, delay) {
+        let timeout;
+        return function executedFunction(...args) {
+            const later = () => {
+                clearTimeout(timeout);
+                func(...args);
+            };
+            clearTimeout(timeout);
+            timeout = setTimeout(later, delay);
+        };
+    },
+
+    truncateText(text, maxLength = 60) {
+        if (!text) return '';
+        if (text.length <= maxLength) return text;
+        return text.substring(0, maxLength) + '...';
+    },
+
+    getInitials(name) {
+        if (!name) return '??';
+        // Curățăm spațiile multiple și trim
+        name = name.trim().replace(/\s+/g, ' ');
+        const parts = name.split(' ');
+        let initials = '';
+        
+        if (parts.length === 1) {
+            // Doar un cuvânt - luăm primele 2 caractere
+            initials = parts[0].substring(0, 2).toUpperCase();
+        } else {
+            // Mai multe cuvinte - luăm prima literă din primele 2 cuvinte
+            for (let i = 0; i < parts.length && initials.length < 2; i++) {
+                if (parts[i].length > 0) {
+                    initials += parts[i][0].toUpperCase();
+                }
+            }
+        }
+        return initials || '??';
+    },
+
+    normalizeId(id) {
+        if (!id) return '';
+        return id.toString().replace(/[{}]/g, '').toLowerCase();
+    },
+
+    linkify(text) {
+        const urlRegex = /(?<!href=")(https?:\/\/[^\s<]+)/g;
+        
+        // Escape HTML pentru a preveni XSS
+        const escapedText = $('<div>').text(text).html();
+
+        const content = escapedText.replace(urlRegex, (url) => {
+            // Decode URL pentru a verifica corect
+            const decodedUrl = $('<div>').html(url).text();
+            
+            if (Utils.isImageUrl(decodedUrl)) {
+                return `
+                    <div class="attachment">
+                        <img src="${decodedUrl}" alt="Imagine atașată" class="attachment-image" 
+                             data-src="${decodedUrl}" loading="lazy"
+                             style="cursor: pointer;"
+                             onerror="this.onerror=null; this.alt='Imagine indisponibilă'; this.classList.add('image-error'); this.style.cursor='default';">
+                    </div>`;
+            } else if (Utils.isPdfUrl(decodedUrl)) {
+                const fileName = decodeURIComponent(decodedUrl.split('/').pop().split('?')[0]);
+                return `
+                    <div class="attachment">
+                        <a href="${decodedUrl}" target="_blank" rel="noopener noreferrer" class="attachment-pdf" 
+                           title="Deschide PDF: ${fileName}">
+                            <i class="fas fa-file-pdf"></i>
+                            <span>${Utils.truncateText(fileName, 30)}</span>
+                            <i class="fas fa-external-link-alt ms-2"></i>
+                        </a>
+                    </div>`;
+            } else {
+                // Verifică dacă e un video sau alt tip de media
+                const videoExtensions = /\.(mp4|webm|ogg|mov|avi)(?:[?#]|$)/i;
+                const audioExtensions = /\.(mp3|wav|ogg|m4a)(?:[?#]|$)/i;
+                
+                if (videoExtensions.test(decodedUrl)) {
+                    return `
+                        <div class="attachment">
+                            <video controls class="attachment-video" style="max-width: 100%; max-height: 300px;">
+                                <source src="${decodedUrl}" type="video/mp4">
+                                Browser-ul dvs. nu suportă redarea video.
+                            </video>
+                        </div>`;
+                } else if (audioExtensions.test(decodedUrl)) {
+                    return `
+                        <div class="attachment">
+                            <audio controls class="attachment-audio">
+                                <source src="${decodedUrl}" type="audio/mpeg">
+                                Browser-ul dvs. nu suportă redarea audio.
+                            </audio>
+                        </div>`;
+                } else {
+                    // Link normal
+                    const displayUrl = Utils.truncateText(decodedUrl, 50);
+                    return `<a href="${decodedUrl}" target="_blank" rel="noopener noreferrer" 
+                              title="${decodedUrl}">${displayUrl}</a>`;
+                }
+            }
+        });
+        
+        // Înlocuiește newline-urile cu <br>
+        return `<p>${content.replace(/\n/g, '<br>')}</p>`;
+    },
+    
+    formatTime(dateString) {
+        if (!dateString) return '';
+        const date = new Date(dateString);
+        const now = new Date();
+        const diffDays = Math.floor((now - date) / (1000 * 60 * 60 * 24));
+        
+        if (diffDays === 0) {
+            return date.toLocaleTimeString('ro-RO', { hour: '2-digit', minute: '2-digit' });
+        } else if (diffDays === 1) {
+            return 'Ieri';
+        } else if (diffDays < 7) {
+            return date.toLocaleDateString('ro-RO', { weekday: 'long' });
+        } else {
+            return date.toLocaleDateString('ro-RO', { day: '2-digit', month: '2-digit' });
+        }
+    },
+
+    getLeadStatusFromValue(value) {
+        return LEAD_STATUS_MAPPING[value] || 'standby';
+    },
+
+    getLeadStatusLabel(status) {
+        return LEAD_STATUS_LABELS[status] || 'Standby';
+    },
+
+    isImageUrl(url) {
+        if (typeof url !== 'string') return false;
+        
+        // Verifică dacă începe cu protocol valid
+        if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('data:image')) {
+            return false;
+        }
+        
+        // Verifică extensii comune de imagine
+        const imageExtensions = /\.(jpeg|jpg|gif|png|webp|bmp|svg)(?:[?#]|$)/i;
+        if (imageExtensions.test(url)) {
+            return true;
+        }
+        
+        // Verifică pentru URL-uri WhatsApp media sau alte servicii CDN
+        const mediaPatterns = [
+            /media[\.-].*\.whatsapp\.net/i,
+            /media\.fmessenger\.com/i,
+            /scontent.*\.fbcdn\.net/i,
+            /\/media\//i,
+            /cloudinary\.com/i,
+            /imgbb\.com/i,
+            /imgur\.com/i
+        ];
+        
+        return mediaPatterns.some(pattern => pattern.test(url));
+    },
+    
+    isPdfUrl(url) {
+        if (typeof url !== 'string') return false;
+        
+        // Verifică extensia PDF
+        const pdfRegex = /\.pdf(?:[?#]|$)/i;
+        if (pdfRegex.test(url)) {
+            return true;
+        }
+        
+        // Verifică parametri sau path-uri care sugerează PDF
+        const pdfPatterns = [
+            /[?&]type=pdf/i,
+            /[?&]format=pdf/i,
+            /\/pdf\//i,
+            /download.*pdf/i
+        ];
+        
+        return pdfPatterns.some(pattern => pattern.test(url));
+    },
+
+    formatDate(dateString) {
+        if (!dateString) return '';
+        const date = new Date(dateString);
+        return date.toLocaleDateString('ro-RO', { 
+            year: 'numeric', 
+            month: '2-digit', 
+            day: '2-digit' 
+        });
+    },
+
+    formatCurrency(amount) {
+        if (!amount && amount !== 0) return '';
+        return new Intl.NumberFormat('ro-RO', {
+            style: 'currency',
+            currency: 'RON',
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 0
+        }).format(amount);
+    }
+};
+
+// API Service - UPDATED WITH NEW FIELDS AND STATUS FIX
+class APIService {
+    static async loadConversations(leadCategoryFilter = 'all', agentFilter = 'all', page = 1, pageSize = 20) {
+        try {
+            if (!window.parent?.Xrm?.WebApi) {
+                throw new Error('Xrm.WebApi nu este disponibil');
+            }
+
+            console.log(`📥 Începe încărcarea conversațiilor. Pagina: ${page}, Dimensiune: ${pageSize}, Filtru categorie: ${leadCategoryFilter}, Filtru agent: ${agentFilter}`);
+            
+            const allMessagesMap = new Map();
+
+            // 1. Fetch all messages to aggregate leads
+            const messageFetchXml = `
+                <fetch version="1.0" output-format="xml-platform" mapping="logical" top="${API_CONFIG.TOP_MESSAGE_RECORDS_TO_FETCH}">
+                    <entity name="new_new_whatsappconversation">
+                        <attribute name="new_new_whatsappconversationid" />
+                        <attribute name="new_leadid" />
+                        <attribute name="new_sentbyid" />
+                        <attribute name="modifiedon" />
+                        <attribute name="new_timestamp" />
+                        <attribute name="new_message" />
+                        <attribute name="new_messageread" />
+                        <attribute name="new_archived" />
+                        <attribute name="new_direction" />
+                        <order attribute="modifiedon" descending="true" />
+                        <filter type="and">
+                            <condition attribute="new_leadid" operator="not-null" />
+                        </filter>
+                        <link-entity name="systemuser" from="systemuserid" to="new_sentbyid" alias="agent" link-type="outer">
+                            <attribute name="fullname" />
+                            <attribute name="systemuserid" />
+                        </link-entity>
+                    </entity>
+                </fetch>`;
+
+            const messageResults = await window.parent.Xrm.WebApi.retrieveMultipleRecords(
+                "new_new_whatsappconversation", 
+                "?fetchXml=" + encodeURIComponent(messageFetchXml)
+            );
+
+            console.log(`📄 ${messageResults.entities.length} înregistrări de mesaje preluate.`);
+
+            messageResults.entities.forEach(msg => {
+                const leadId = msg["_new_leadid_value"];
+                if (leadId) {
+                    if (!allMessagesMap.has(leadId)) {
+                        allMessagesMap.set(leadId, []);
+                    }
+                    allMessagesMap.get(leadId).push(msg);
+                }
+            });
+
+            // 2. Aggregate data for each lead from the fetched messages
+            const aggregatedLeadData = new Map();
+            for (const [leadId, messages] of allMessagesMap) {
+                if (messages.length === 0) continue;
+
+                try {
+                    messages.sort((a, b) => {
+                        const dateA = new Date(a.new_timestamp || a.modifiedon);
+                        const dateB = new Date(b.new_timestamp || b.modifiedon);
+                        return dateB - dateA;
+                    });
+
+                    const latestMessage = messages[0];
+                    let unreadCount = 0;
+                    messages.forEach(m => {
+                        // Numără doar mesajele INCOMING necitite
+                        if ((m.new_messageread === false || m.new_messageread === 0) && m.new_direction === 1) {
+                            unreadCount++;
+                        }
+                    });
+
+                    let lastIncomingClientTimestamp = null;
+                    for (const msg of messages) {
+                        if (msg.new_direction === 1) {
+                            lastIncomingClientTimestamp = msg.new_timestamp || msg.modifiedon;
+                            break;
+                        }
+                    }
+
+                    aggregatedLeadData.set(leadId, {
+                        conversationId: latestMessage.new_new_whatsappconversationid,
+                        lastActivity: latestMessage.new_timestamp || latestMessage.modifiedon,
+                        lastMessage: latestMessage.new_message || '',
+                        assignedAgent: latestMessage["_new_sentbyid_value"],
+                        assignedAgentName: latestMessage["agent.fullname"],
+                        archived: latestMessage.new_archived === true || latestMessage.new_archived === 1,
+                        unreadCount: unreadCount,
+                        lastIncomingClientTimestamp: lastIncomingClientTimestamp,
+                        isPlaceholder: false
+                    });
+                } catch (error) {
+                    console.error(`Eroare la procesarea mesajelor pentru lead ${leadId}:`, error);
+                }
+            }
+            
+            console.log(`📊 ${aggregatedLeadData.size} lead-uri unice cu mesaje găsite.`);
+            if (aggregatedLeadData.size === 0) {
+                return {
+                    conversations: [],
+                    hasMore: false,
+                    page: page,
+                    pageSize: pageSize,
+                    totalLoaded: 0
+                };
+            }
+
+            // 3. Construiește condiții pentru filtrare
+            let leadStatusCondition = '';
+            if (leadCategoryFilter && leadCategoryFilter !== 'all') {
+                const statusValue = Object.keys(LEAD_STATUS_MAPPING).find(
+                    key => LEAD_STATUS_MAPPING[key] === leadCategoryFilter
+                );
+                if (statusValue) {
+                    leadStatusCondition = `<condition attribute="new_leadstatus" operator="eq" value="${statusValue}" />`;
+                    console.log(`ℹ️ Filtru status: ${leadCategoryFilter} (${statusValue})`);
+                }
+            }
+
+            let agentFilterCondition = '';
+            if (agentFilter && agentFilter !== 'all') {
+                if (agentFilter === 'mine') {
+                    if (CURRENT_USER && CURRENT_USER.id) {
+                        agentFilterCondition = `<condition attribute="ownerid" operator="eq" value="${CURRENT_USER.id}" />`;
+                        console.log(`👤 Filtru: Doar lead-urile mele (${CURRENT_USER.id})`);
+                    }
+                } else if (agentFilter === 'unassigned') {
+                    agentFilterCondition = `<condition attribute="ownerid" operator="null" />`;
+                    console.log(`❓ Filtru: Doar lead-urile neatribuite`);
+                } else {
+                    agentFilterCondition = `<condition attribute="ownerid" operator="eq" value="${agentFilter}" />`;
+                    console.log(`👥 Filtru: Lead-uri pentru agentul ${agentFilter}`);
+                }
+            }
+
+            // 4. Fetch Lead entity details pentru TOATE lead-urile cu mesaje, în batch-uri
+            const allLeadIds = Array.from(aggregatedLeadData.keys());
+            const allLeadDetails = new Map();
+            const batchSize = 50; // Batch mai mare pentru a prelua toate lead-urile
+
+            for (let i = 0; i < allLeadIds.length; i += batchSize) {
+                const batchLeadIds = allLeadIds.slice(i, i + batchSize);
+                const leadConditions = batchLeadIds.map(id => 
+                    `<condition attribute="leadid" operator="eq" value="${id}" />`
+                ).join('');
+
+                const leadFetchXml = `
+                    <fetch version="1.0" output-format="xml-platform" mapping="logical">
+                        <entity name="lead">
+                            <attribute name="leadid" />
+                            <attribute name="fullname" />
+                            <attribute name="firstname" />
+                            <attribute name="lastname" />
+                            <attribute name="telephone1" />
+                            <attribute name="mobilephone" />
+                            <attribute name="emailaddress1" />
+                            <attribute name="statuscode" />
+                            <attribute name="new_leadstatus" />
+                            <attribute name="modifiedon" />
+                            <attribute name="ownerid" />
+                            <attribute name="new_businessunit" />
+                            <attribute name="new_rectificarebc" />
+                            <attribute name="new_nevoipersonale" />
+                            <attribute name="new_ipotecar" />
+                            <attribute name="confirminterest" />
+                            <attribute name="qualificationcomments" />
+                            <attribute name="new_tipvenit" />
+                            <attribute name="new_salary" />
+                            <filter type="and">
+                                <filter type="or">
+                                    ${leadConditions}
+                                </filter>
+                            </filter>
+                            <link-entity name="businessunit" from="businessunitid" to="new_businessunit" alias="businessUnit" link-type="outer">
+                                <attribute name="name" />
+                            </link-entity>
+                            <link-entity name="systemuser" from="systemuserid" to="ownerid" alias="owner" link-type="outer">
+                                <attribute name="fullname" />
+                            </link-entity>
+                        </entity>
+                    </fetch>`;
+                
+                try {
+                    const leadResults = await window.parent.Xrm.WebApi.retrieveMultipleRecords(
+                        "lead", 
+                        "?fetchXml=" + encodeURIComponent(leadFetchXml)
+                    );
+                    
+                    leadResults.entities.forEach(lead => {
+                        allLeadDetails.set(lead.leadid, lead);
+                    });
+                } catch (error) {
+                    console.error(`Eroare la preluarea detaliilor pentru batch ${i}-${i + batchSize}:`, error);
+                }
+            }
+
+            console.log(`📋 Detalii preluate pentru ${allLeadDetails.size} lead-uri din ${allLeadIds.length}`);
+
+            // 5. Construiește conversațiile finale aplicând filtrele
+            const finalConversations = [];
+            
+            for (const [leadId, aggData] of aggregatedLeadData) {
+                const leadEntity = allLeadDetails.get(leadId);
+                if (!leadEntity) {
+                    console.warn(`⚠️ Nu s-au găsit detalii pentru lead ${leadId}`);
+                    continue;
+                }
+
+                // Aplică filtrul de status
+                if (leadStatusCondition) {
+                    const leadStatus = leadEntity.new_leadstatus;
+                    const expectedStatus = Object.keys(LEAD_STATUS_MAPPING).find(
+                        key => LEAD_STATUS_MAPPING[key] === leadCategoryFilter
+                    );
+                    if (leadStatus !== parseInt(expectedStatus)) {
+                        continue; // Skip acest lead
+                    }
+                }
+
+                // Aplică filtrul de agent
+                if (agentFilterCondition) {
+                    const ownerId = leadEntity["_ownerid_value"];
+                    
+                    if (agentFilter === 'mine') {
+                        if (!ownerId || ownerId !== CURRENT_USER?.id) {
+                            continue; // Skip - nu este al utilizatorului curent
+                        }
+                    } else if (agentFilter === 'unassigned') {
+                        if (ownerId) {
+                            continue; // Skip - este atribuit
+                        }
+                    } else if (agentFilter !== 'all') {
+                        if (ownerId !== agentFilter) {
+                            continue; // Skip - nu aparține agentului selectat
+                        }
+                    }
+                }
+
+                // Lead-ul trece toate filtrele - îl adăugăm
+                const owner = leadEntity["_ownerid_value"] ? {
+                    id: leadEntity["_ownerid_value"],
+                    name: leadEntity["owner.fullname"] || leadEntity["_ownerid_value@OData.Community.Display.V1.FormattedValue"] || "Proprietar necunoscut"
+                } : null;
+                
+                const businessUnit = leadEntity["_new_businessunit_value"] ? 
+                    leadEntity["businessUnit.name"] || 
+                    leadEntity["_new_businessunit_value@OData.Community.Display.V1.FormattedValue"] || 
+                    null : null;
+                
+                const fullName = leadEntity.fullname || leadEntity["fullname"];
+                const firstName = leadEntity.firstname || leadEntity["firstname"];
+                const displayName = fullName || firstName || "Nume necunoscut";
+                
+                const businessPhone = leadEntity.telephone1 || leadEntity["telephone1"];
+                const mobilePhone = leadEntity.mobilephone || leadEntity["mobilephone"];
+                const phone = businessPhone || mobilePhone || "N/A";
+                
+                finalConversations.push({
+                    id: leadEntity.leadid,
+                    conversationId: aggData.conversationId,
+                    name: displayName,
+                    phone: phone,
+                    email: leadEntity.emailaddress1 || leadEntity["emailaddress1"],
+                    businessUnit: businessUnit,
+                    ownerName: owner ? owner.name : null,
+                    statusCode: leadEntity["statuscode@OData.Community.Display.V1.FormattedValue"] || 
+                             (leadEntity.statuscode ? leadEntity.statuscode.toString() : "Necunoscut"),
+                    lastActivity: aggData.lastActivity || leadEntity.modifiedon,
+                    unreadCount: aggData.unreadCount,
+                    lastMessage: aggData.lastMessage,
+                    priority: 'normal',
+                    archived: aggData.archived,
+                    starred: false,
+                    status: leadEntity.new_leadstatus || '100000002',
+                    assignedAgent: owner ? owner.id : aggData.assignedAgent,
+                    assignedAgentName: owner ? owner.name : aggData.assignedAgentName,
+                    lastIncomingMessageTimestamp: aggData.lastIncomingClientTimestamp,
+                    // New fields
+                    rectificareBC: leadEntity.new_rectificarebc,
+                    nevoiPersonale: leadEntity.new_nevoipersonale,
+                    ipotecar: leadEntity.new_ipotecar,
+                    confirmInterest: leadEntity.confirminterest,
+                    qualificationComments: leadEntity.qualificationcomments,
+                    tipVenit: leadEntity.new_tipvenit,
+                    salary: leadEntity.new_salary
+                });
+            }
+
+            console.log(`✅ ${finalConversations.length} conversații după aplicarea filtrelor (din ${aggregatedLeadData.size} lead-uri cu mesaje)`);
+
+            // 6. Sortează conversațiile după ultima activitate
+            finalConversations.sort((a, b) => {
+                return new Date(b.lastActivity) - new Date(a.lastActivity);
+            });
+
+            // 7. Aplică paginarea
+            const startIndex = (page - 1) * pageSize;
+            const endIndex = startIndex + pageSize;
+            const paginatedConversations = finalConversations.slice(startIndex, endIndex);
+            const hasMore = endIndex < finalConversations.length;
+            
+            console.log(`📄 Paginare: Total ${finalConversations.length} conversații, afișez ${startIndex}-${Math.min(endIndex, finalConversations.length)}`);
+            
+            return {
+                conversations: paginatedConversations,
+                hasMore: hasMore,
+                page: page,
+                pageSize: pageSize,
+                totalLoaded: finalConversations.length
+            };
+            
+        } catch (error) {
+            console.error("Eroare complexă în APIService.loadConversations:", error);
+            console.dir(error);
+            throw new Error(`Nu s-au putut încărca conversațiile: ${error.message}`);
+        }
+    }
+
+    static async loadLeadDetails(leadId) {
+        if (!window.parent?.Xrm?.WebApi) {
+            console.error('Funcția de încărcare detalii lead nu este disponibilă în acest mediu (Xrm.WebApi nu este definit).');
+            alert('Încărcarea detaliilor lead-ului nu este disponibilă în acest mediu. Această funcție funcționează doar în Dynamics 365.');
+            return null;
+        }
+        try {
+            console.log(`Fetching details for lead: ${leadId}`);
+            const result = await window.parent.Xrm.WebApi.retrieveRecord("lead", leadId, 
+                "?$select=fullname,firstname,lastname,telephone1,mobilephone,emailaddress1,cr461_id_afacere,ownerid,statuscode,new_rectificarebc,new_nevoipersonale,new_ipotecar,confirminterest,qualificationcomments,new_tipvenit,new_salary"
+            );
+            console.log("Lead details result:", result);
+            return result;
+        } catch (error) {
+            console.error(`Eroare la încărcarea detaliilor pentru lead ${leadId}:`, error);
+            return null;
+        }
+    }
+
+    static async assignAgent(leadId, agentId) {
+        if (!window.parent?.Xrm?.WebApi) {
+            console.error('Funcția de atribuire agent nu este disponibilă în acest mediu (Xrm.WebApi nu este definit).');
+            alert('Atribuirea agentului nu este disponibilă în acest mediu. Această funcție funcționează doar în Dynamics 365.');
+            return;
+        }
+        let data = {};
+        if (agentId === 'unassign') {
+            data = {};
+        } else {
+            data = {
+                "ownerid@odata.bind": `/systemusers(${agentId})`
+            };
+        }
+        Object.keys(data).forEach(key => {
+            if (data[key] === undefined || data[key] === null || data[key] === '') {
+                delete data[key];
+            }
+        });
+        try {
+            await window.parent.Xrm.WebApi.updateRecord("lead", leadId, data);
+            console.log(`✅ Lead ${leadId} atribuit cu succes agentului ${agentId}`);
+        } catch (error) {
+            console.error(`Eroare la atribuirea agentului pentru lead ${leadId}:`, error);
+            alert('A apărut o eroare la atribuirea agentului. Verificați consola pentru detalii.');
+            throw error;
+        }
+    }
+
+    static async deleteConversation(leadId) {
+        try {
+            console.log(`✅ Conversația pentru lead ${leadId} a fost ștearsă (simulat).`);
+        } catch (error) {
+            console.error(`Eroare la ștergerea conversației pentru lead ${leadId}:`, error);
+            throw error;
+        }
+    }
+
+    static async loadLastMessages(leadIds) {
+        try {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            const previews = {};
+            leadIds.forEach(id => {
+                previews[id] = {
+                    lastMessage: "Acesta este un preview al ultimului mesaj...",
+                };
+            });
+            return previews;
+        } catch (error) {
+            console.error('Eroare la încărcarea preview-urilor de mesaje:', error);
+            return {};
+        }
+    }
+
+    // FIXED updateLeadStatus METHOD
+    static async updateLeadStatus(leadId, statusValue) {
+        // Convertește din string la valoare numerică dacă este necesar
+        let numericStatus = statusValue;
+        
+        // Dacă primim un string (ex: 'nu-raspunde'), găsim valoarea numerică
+        if (isNaN(statusValue)) {
+            numericStatus = Object.keys(LEAD_STATUS_MAPPING).find(
+                key => LEAD_STATUS_MAPPING[key] === statusValue
+            );
+            
+            if (!numericStatus) {
+                console.error(`Status invalid: ${statusValue}`);
+                throw new Error(`Statusul "${statusValue}" nu există în mapping`);
+            }
+            
+            numericStatus = parseInt(numericStatus);
+        }
+        
+        const data = {
+            "new_leadstatus": numericStatus
+        };
+        
+        try {
+            await window.parent.Xrm.WebApi.updateRecord("lead", leadId, data);
+            console.log(`✅ Statusul pentru lead ${leadId} a fost actualizat la ${numericStatus} (${statusValue})`);
+        } catch (error) {
+            console.error(`Eroare la actualizarea statusului pentru lead ${leadId}:`, error);
+            throw error;
+        }
+    }
+
+    // NEW METHOD FOR UPDATING LEAD FIELDS
+    static async updateLeadField(leadId, fieldName, fieldValue) {
+        if (!window.parent?.Xrm?.WebApi) {
+            console.error('Funcția de actualizare câmp nu este disponibilă în acest mediu.');
+            return;
+        }
+        
+        const data = {};
+        data[fieldName] = fieldValue;
+        
+        try {
+            await window.parent.Xrm.WebApi.updateRecord("lead", leadId, data);
+            console.log(`✅ Câmpul ${fieldName} actualizat pentru lead ${leadId}`);
+            return true;
+        } catch (error) {
+            console.error(`Eroare la actualizarea câmpului ${fieldName} pentru lead ${leadId}:`, error);
+            throw error;
+        }
+    }
+
+    // FUNCȚIA CORECTATĂ PENTRU MARCAREA MESAJELOR CA CITITE
+    static async markMessagesAsRead(leadId) {
+        try {
+            if (!window.parent?.Xrm?.WebApi) {
+                throw new Error('Xrm.WebApi nu este disponibil');
+            }
+            
+            console.log(`📖 Se marchează ca citite mesajele pentru lead ${leadId}...`);
+            
+            // 1. Mai întâi, găsim toate mesajele necitite pentru acest lead
+            const fetchXml = `
+                <fetch version="1.0" output-format="xml-platform" mapping="logical" top="50">
+                    <entity name="new_new_whatsappconversation">
+                        <attribute name="new_new_whatsappconversationid" />
+                        <filter type="and">
+                            <condition attribute="new_leadid" operator="eq" value="${leadId}" />
+                            <condition attribute="new_messageread" operator="eq" value="false" />
+                            <condition attribute="new_direction" operator="eq" value="1" />
+                        </filter>
+                    </entity>
+                </fetch>`;
+            
+            const unreadMessages = await window.parent.Xrm.WebApi.retrieveMultipleRecords(
+                "new_new_whatsappconversation", 
+                "?fetchXml=" + encodeURIComponent(fetchXml)
+            );
+            
+            console.log(`📊 ${unreadMessages.entities.length} mesaje necitite găsite pentru lead ${leadId}`);
+            
+            // Dacă nu există mesaje necitite, returnăm succes
+            if (unreadMessages.entities.length === 0) {
+                console.log(`ℹ️ Nu există mesaje necitite pentru lead ${leadId}`);
+                return true;
+            }
+            
+            // 2. Actualizăm fiecare mesaj necitit
+            let updatedCount = 0;
+            for (const message of unreadMessages.entities) {
+                try {
+                    await window.parent.Xrm.WebApi.updateRecord(
+                        "new_new_whatsappconversation", 
+                        message.new_new_whatsappconversationid, 
+                        {
+                            "new_messageread": true
+                        }
+                    );
+                    updatedCount++;
+                } catch (updateError) {
+                    console.error(`Eroare la actualizarea mesajului ${message.new_new_whatsappconversationid}:`, updateError);
+                }
+            }
+            
+            console.log(`✅ ${updatedCount} mesaje marcate ca citite pentru lead ${leadId}`);
+            return true;
+            
+        } catch (error) {
+            console.error(`Eroare la marcarea mesajelor ca citite pentru lead ${leadId}:`, error);
+            throw error;
+        }
+    }
+    
+    static async loadMessages(leadId) {
+        try {
+            if (!window.parent?.Xrm?.WebApi) {
+                throw new Error('Xrm.WebApi nu este disponibil');
+            }
+            console.log(`📨 Încarcă mesajele pentru lead: ${leadId}`);
+            const messageFetchXml = `
+                <fetch version="1.0" output-format="xml-platform" mapping="logical" top="100"> 
+                    <entity name="new_new_whatsappconversation">
+                        <attribute name="new_new_whatsappconversationid" />
+                        <attribute name="new_message" />
+                        <attribute name="new_direction" />
+                        <attribute name="new_timestamp" />
+                        <attribute name="createdon" />
+                        <attribute name="new_messageread" />
+                        <attribute name="new_archived" />
+                        <attribute name="new_sentbyid" />
+                        <order attribute="new_timestamp" ascending="true" />
+                        <filter type="and">
+                            <condition attribute="new_leadid" operator="eq" value="${leadId}" />
+                            <condition attribute="new_message" operator="not-null" />
+                        </filter>
+                        <link-entity name="systemuser" from="systemuserid" to="new_sentbyid" alias="sentBy" link-type="outer">
+                            <attribute name="fullname" />
+                        </link-entity>
+                    </entity>
+                </fetch>`;
+
+            const result = await window.parent.Xrm.WebApi.retrieveMultipleRecords(
+                "new_new_whatsappconversation", 
+                "?fetchXml=" + encodeURIComponent(messageFetchXml)
+            );
+            console.log(`📨 ${result.entities.length} mesaje încărcate pentru lead ${leadId}`);
+            
+            // Limitează numărul de mesaje pentru a preveni probleme de memorie
+            const MAX_MESSAGES_IN_MEMORY = 100;
+            const messages = result.entities.slice(0, MAX_MESSAGES_IN_MEMORY);
+            
+            // Detectează și loghează mesajele cu media
+            let mediaCount = { images: 0, pdfs: 0, other: 0 };
+            messages.forEach(msg => {
+                if (msg.new_message) {
+                    if (Utils.isImageUrl(msg.new_message)) {
+                        mediaCount.images++;
+                        console.log(`🖼️ Imagine detectată: ${msg.new_message.substring(0, 50)}...`);
+                    } else if (Utils.isPdfUrl(msg.new_message)) {
+                        mediaCount.pdfs++;
+                        console.log(`📄 PDF detectat: ${msg.new_message.substring(0, 50)}...`);
+                    }
+                }
+            });
+            
+            if (mediaCount.images > 0 || mediaCount.pdfs > 0) {
+                console.log(`📎 Media în conversație: ${mediaCount.images} imagini, ${mediaCount.pdfs} PDF-uri`);
+            }
+            
+            return messages.map(entity => ({
+                id: entity.new_new_whatsappconversationid,
+                content: entity.new_message || '',
+                timestamp: entity.new_timestamp || entity.createdon,
+                type: entity.new_direction === 1 ? 'incoming' : 'outgoing',
+                status: entity.new_direction === 1 ? 'received' : 'sent',
+                direction: entity.new_direction,
+                read: entity.new_messageread === true || entity.new_messageread === 1,
+                archived: entity.new_archived === true || entity.new_archived === 1,
+                sentBy: entity["sentBy.fullname"] || (entity.new_direction === 1 ? 'Client' : 'Agent')
+            }));
+        } catch (error) {
+            console.error('Eroare la încărcarea mesajelor:', error);
+            throw error;
+        }
+    }
+
+    // NEW METHOD FOR CHECKING NEW MESSAGES
+    static async checkForNewMessages(lastCheckTimestamp) {
+        try {
+            if (!window.parent?.Xrm?.WebApi) {
+                throw new Error('Xrm.WebApi nu este disponibil');
+            }
+            
+            const fetchXml = `
+                <fetch version="1.0" output-format="xml-platform" mapping="logical" top="50">
+                    <entity name="new_new_whatsappconversation">
+                        <attribute name="new_new_whatsappconversationid" />
+                        <attribute name="new_leadid" />
+                        <attribute name="new_message" />
+                        <attribute name="new_timestamp" />
+                        <attribute name="new_direction" />
+                        <filter type="and">
+                            <condition attribute="new_direction" operator="eq" value="1" />
+                            <condition attribute="new_timestamp" operator="gt" value="${lastCheckTimestamp}" />
+                        </filter>
+                    </entity>
+                </fetch>`;
+            
+            const result = await window.parent.Xrm.WebApi.retrieveMultipleRecords(
+                "new_new_whatsappconversation", 
+                "?fetchXml=" + encodeURIComponent(fetchXml)
+            );
+            
+            return result.entities;
+        } catch (error) {
+            console.error('Eroare la verificarea mesajelor noi:', error);
+            throw error;
+        }
+    }
+
+    // FUNCȚIA CORECTATĂ PENTRU TRIMITERE MESAJE
+    static async sendMessage(leadId, message, phoneNumber, sendById) {
+        try {
+            if (!API_CONFIG.sendMessage) {
+                throw new Error("URL-ul pentru trimiterea mesajelor nu este configurat.");
+            }
+            if (!phoneNumber || typeof phoneNumber !== 'string' || phoneNumber.trim() === '') {
+                throw new Error("Numărul de telefon este necesar și trebuie să fie un șir valid pentru a trimite un mesaj.");
+            }
+            if (!message || typeof message !== 'string' || message.trim() === '') {
+                throw new Error("Mesajul nu poate fi gol.");
+            }
+
+            const cleanedNumber = phoneNumber.replace(/\D/g, ''); // Eliminăm caracterele non-numerice
+            let formattedPhoneNumber;
+
+            if (cleanedNumber === '') {
+                throw new Error("Numărul de telefon este gol după eliminarea caracterelor non-numerice.");
+            }
+
+            // LOGICA CORECTĂ DE FORMATARE PENTRU ROMÂNIA
+            if (cleanedNumber.startsWith('0')) {
+                // Număr românesc cu 0 în față (ex: 0722123456) devine 40722123456
+                formattedPhoneNumber = '4' + cleanedNumber;
+            } else if (cleanedNumber.startsWith('4') && cleanedNumber.length === 11) {
+                // Număr deja în format internațional (ex: 40722123456)
+                formattedPhoneNumber = cleanedNumber;
+            } else if (cleanedNumber.length === 9 && (cleanedNumber.startsWith('7') || cleanedNumber.startsWith('2') || cleanedNumber.startsWith('3'))) {
+                // Număr fără prefix (ex: 722123456) devine 40722123456
+                formattedPhoneNumber = '40' + cleanedNumber;
+            } else {
+                // Altfel, folosim numărul așa cum este
+                formattedPhoneNumber = cleanedNumber;
+            }
+
+            console.log(`📤 Trimite mesaj liber către lead ${leadId}. Număr original: ${phoneNumber}, Număr formatat final: ${formattedPhoneNumber}. Mesaj: ${message.substring(0, 50)}...`);
+            
+            const payload = {
+                action: "sendMessage", 
+                leadId: leadId,
+                phoneNumber: formattedPhoneNumber,
+                message: message,
+                sendById: sendById 
+            };
+
+            const response = await fetch(API_CONFIG.sendMessage, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                const errorBody = await response.text();
+                console.error('Eroare corp răspuns (sendMessage PA Flow):', errorBody);
+                throw new Error(`HTTP ${response.status} (${response.statusText}) la trimiterea mesajului.`);
+            }
+            
+            console.log(`✅ Mesaj liber trimis către ${formattedPhoneNumber} via Power Automate.`);
+            return await response.json().catch(() => ({ success: true, message: "Mesaj trimis spre procesare." }));
+        } catch (error) {
+            console.error('Eroare la trimiterea mesajului liber prin Power Automate:', error);
+            alert(`Nu s-a putut trimite mesajul: ${error.message}`);
+            throw error;
+        }
+    }
+
+    // FUNCȚIA PENTRU TRIMITERE TEMPLATE-URI
+    static async sendTemplateMessage(leadId, templateName, templateParams, phoneNumber) {
+        try {
+            if (!API_CONFIG.sendTemplateMessageUrl) {
+                throw new Error("URL-ul pentru trimiterea mesajelor șablon nu este configurat.");
+            }
+            if (!phoneNumber || typeof phoneNumber !== 'string' || phoneNumber.trim() === '') {
+                throw new Error("Numărul de telefon este necesar și trebuie să fie un șir valid pentru a trimite un mesaj șablon.");
+            }
+
+            const cleanedNumber = phoneNumber.replace(/\D/g, '');
+            let formattedPhoneNumber;
+
+            if (cleanedNumber === '') {
+                throw new Error("Numărul de telefon este gol după eliminarea caracterelor non-numerice.");
+            }
+
+            // LOGICA DE FORMATARE PENTRU ROMÂNIA
+            if (cleanedNumber.startsWith('0')) {
+                formattedPhoneNumber = '4' + cleanedNumber;
+            } else if (cleanedNumber.startsWith('4') && cleanedNumber.length === 11) {
+                formattedPhoneNumber = cleanedNumber;
+            } else if (cleanedNumber.length === 9 && (cleanedNumber.startsWith('7') || cleanedNumber.startsWith('2') || cleanedNumber.startsWith('3'))) {
+                formattedPhoneNumber = '40' + cleanedNumber;
+            } else {
+                formattedPhoneNumber = cleanedNumber;
+            }
+
+            console.log(`📨 Trimitere mesaj șablon '${templateName}' către Lead ${leadId}`);
+            console.log(`📱 Număr: ${phoneNumber} → ${formattedPhoneNumber}`);
+            console.log(`📝 Parametri template:`, templateParams);
+
+            // Formatează parametrii pentru Power Automate
+            // Convertește obiectul în array dacă e necesar
+            let formattedParams = templateParams;
+            if (typeof templateParams === 'object' && !Array.isArray(templateParams)) {
+                // Dacă avem parametri ca {"1": "value1", "2": "value2"}
+                // îi convertim în ["value1", "value2"]
+                const keys = Object.keys(templateParams).filter(k => !isNaN(k)).sort();
+                if (keys.length > 0) {
+                    formattedParams = keys.map(k => templateParams[k]);
+                }
+            }
+
+            const payload = {
+                leadid: leadId,
+                templatename: templateName,
+                templateparameters: formattedParams, // Array sau obiect, depinde de ce așteaptă Power Automate
+                phonenumber: formattedPhoneNumber,
+                userid: CURRENT_USER ? CURRENT_USER.id : null
+            };
+
+            console.log(`🚀 Payload trimis către Power Automate:`, JSON.stringify(payload, null, 2));
+
+            const response = await fetch(API_CONFIG.sendTemplateMessageUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(payload)
+            });
+
+            const responseText = await response.text();
+            console.log(`📨 Răspuns Power Automate (status: ${response.status}):`, responseText);
+
+            if (!response.ok) {
+                console.error('❌ Eroare de la Power Automate:', response.status, responseText);
+                
+                // Încearcă să parseze eroarea
+                let errorMessage = `HTTP ${response.status}`;
+                try {
+                    const errorData = JSON.parse(responseText);
+                    if (errorData.error || errorData.message) {
+                        errorMessage = errorData.error || errorData.message;
+                    }
+                } catch (e) {
+                    errorMessage = responseText || `HTTP ${response.status}`;
+                }
+                
+                throw new Error(`Eroare la trimiterea template-ului: ${errorMessage}`);
+            }
+
+            // Încearcă să parseze răspunsul ca JSON
+            let responseData;
+            try {
+                responseData = JSON.parse(responseText);
+            } catch (e) {
+                console.warn('⚠️ Răspunsul nu este JSON valid, folosim ca text:', responseText);
+                responseData = { success: true, response: responseText };
+            }
+
+            console.log("✅ Template trimis cu succes:", responseData);
+            return { success: true, data: responseData };
+
+        } catch (error) {
+            console.error("❌ Eroare în APIService.sendTemplateMessage:", error);
+            alert(`Nu s-a putut trimite mesajul șablon: ${error.message}`);
+            return { success: false, error: error.message };
+        }
+    }
+}
+
+// UI Manager - UPDATED WITH NEW METHODS
+class UIManager {
+    constructor(state) {
+        this.state = state;
+        this.editingFields = new Set(); // Track which fields are being edited
+        this.isLoadingMessages = false; // Flag pentru a preveni încărcări simultane
+        this.initializeElements();
+        this.bindEvents();
+        this.populateStatusDropdown();
+        this.populateAgentFilterDropdown();
+    }
+
+    initializeElements() {
+        this.elements = {
+            conversationsList: $('#conversationsList'),
+            searchInput: $('#searchInput'),
+            clearSearch: $('#clearSearch'),
+            filterTabs: $('.filter-tab'),
+            categoryTabs: $('.status-tab'),
+            chatHeader: $('#chatHeader'),
+            chatArea: $('#chatArea'), // ADĂUGAT PENTRU MOBIL
+            sidebar: $('#sidebar'), // ADĂUGAT PENTRU MOBIL
+            clientAvatar: $('#clientAvatar'),
+            clientName: $('#clientName'),
+            clientStatus: $('#clientStatus'),
+            statusText: $('#statusText'),
+            statusBadge: $('#statusBadge'),
+            messagesContainer: $('#messagesContainer'),
+            inputArea: $('#inputArea'),
+            messageInput: $('#messageInput'),
+            sendBtn: $('#sendBtn'),
+            templateBtn: $('#templateBtn'), // Buton pentru template-uri
+            quickActions: $('.quick-action'),
+            contextMenu: $('#contextMenu'),
+            settingsModal: $('#settingsModal'),
+            refreshBtn: $('#refreshBtn'),
+            statusBtn: $('#statusBtn'),
+            statusDropdown: $('#statusDropdown'),
+            statusDropdownButton: $('#statusDropdownButton'),
+            statusDropdownText: $('.status-dropdown-text'),
+            statusFilterDropdown: $('#statusFilterDropdown'),
+            agentFilterTabs: $('.agent-filter-tab'),
+            agentBtn: $('#agentBtn'),
+            agentDropdown: $('#agentDropdown'),
+            infoBtn: $('#infoBtn'),
+            clientInfoPanel: $('#clientInfoPanel'),
+            closeInfoPanel: $('#closeInfoPanel'),
+            infoPanelContent: $('#infoPanelContent')
+        };
+    }
+
+    populateStatusDropdown() {
+        if (!this.elements || !this.elements.statusFilterDropdown || this.elements.statusFilterDropdown.length === 0) {
+            console.warn('Dropdown-ul de statusuri nu există în DOM');
+            return;
+        }
+
+        this.elements.statusFilterDropdown.empty();
+
+        this.elements.statusFilterDropdown.append(`
+            <div class="status-dropdown-item" data-status="all">
+                <span class="status-icon all"></span>
+                Toate statusurile
+            </div>
+        `);
+
+        for (const [key, label] of Object.entries(LEAD_STATUS_LABELS)) {
+            this.elements.statusFilterDropdown.append(`
+                <div class="status-dropdown-item" data-status="${key}">
+                    <span class="status-icon status-${key}"></span>
+                    ${label}
+                </div>
+            `);
+        }
+    }
+
+    populateAgentDropdown() {
+        if (!this.elements || !this.elements.agentDropdown || this.elements.agentDropdown.length === 0) {
+            console.warn('Dropdown-ul de agenți nu există în DOM');
+            return;
+        }
+        console.log('[populateAgentDropdown] currentUser:', this.state.currentUser);
+        console.log('[populateAgentDropdown] agents:', this.state.agents);
+        
+        this.elements.agentDropdown.empty();
+        
+        if (this.state.currentUser) {
+            this.elements.agentDropdown.append(`
+                <div class="agent-dropdown-item" data-agent="${this.state.currentUser.id}">
+                    <span class="agent-badge self">Eu</span>
+                    Preluare de către mine
+                </div>
+            `);
+        }
+        
+        if (this.state.agents && this.state.agents.length > 0) {
+            this.state.agents.forEach(agent => {
+                if (agent.id === this.state.currentUser?.id) return;
+                this.elements.agentDropdown.append(`
+                    <div class="agent-dropdown-item" data-agent="${agent.id}">
+                        <span class="agent-badge">${agent.initials || Utils.getInitials(agent.name)}</span>
+                        ${agent.name}
+                    </div>
+                `);
+            });
+        } else {
+            this.elements.agentDropdown.append('<div class="agent-dropdown-item disabled">Niciun agent disponibil</div>');
+        }
+    }
+
+    populateAgentFilterDropdown() {
+        const dropdown = $('#agentFilterDropdown');
+        if (!dropdown || dropdown.length === 0) {
+            console.warn('Dropdown-ul de filtrare agenți nu există în DOM');
+            return;
+        }
+        
+        // Curăță dropdown-ul și adaugă opțiunile statice
+        dropdown.empty();
+        
+        // Opțiuni statice
+        dropdown.append(`
+            <div class="status-dropdown-item" data-agent="all">
+                <i class="fas fa-users"></i>
+                Toți agenții
+            </div>
+            <div class="status-dropdown-item" data-agent="mine">
+                <i class="fas fa-user"></i>
+                Atribuite mie
+            </div>
+            <div class="status-dropdown-item" data-agent="unassigned">
+                <i class="fas fa-user-slash"></i>
+                Neatribuite
+            </div>
+        `);
+        
+        // Adaugă separator și lista de agenți
+        if (this.state.agents && this.state.agents.length > 0) {
+            dropdown.append('<div class="dropdown-separator"></div>');
+            this.state.agents.forEach(agent => {
+                dropdown.append(`
+                    <div class="status-dropdown-item" data-agent="${agent.id}">
+                        <span class="agent-badge">${agent.initials || Utils.getInitials(agent.name)}</span>
+                        ${agent.name}
+                    </div>
+                `);
+            });
+        }
+    }
+
+    bindEvents() {
+        // FIX PENTRU SCROLL PE MOBIL - ADĂUGAT AICI
+        this.enableMobileScroll();
+        this.enableMobilePullToRefresh();
+
+        // Search
+        this.elements.searchInput.on('input', Utils.debounce((e) => {
+            this.state.filters.search = e.target.value;
+            // Nu resetăm paginarea pentru căutare locală
+            this.renderConversations();
+            this.toggleClearButton();
+        }, 300));
+
+        this.elements.clearSearch.on('click', () => {
+            this.elements.searchInput.val('');
+            this.state.filters.search = '';
+            this.renderConversations();
+            this.toggleClearButton();
+        });
+
+        // Primary Filters
+        this.elements.filterTabs.on('click', (e) => {
+            const filter = $(e.currentTarget).data('filter');
+            this.state.filters.category = filter;
+            this.elements.filterTabs.removeClass('active');
+            $(e.currentTarget).addClass('active');
+            // Nu resetăm paginarea pentru filtre locale
+            this.renderConversations();
+        });
+
+        // Status Dropdown Button
+        this.elements.statusDropdownButton.on('click', (e) => {
+            e.stopPropagation();
+            this.elements.statusFilterDropdown.toggleClass('show');
+        });
+
+        // Status Dropdown Items
+        this.elements.statusFilterDropdown.on('click', '.status-dropdown-item', (e) => {
+            e.stopPropagation();
+            const status = $(e.currentTarget).data('status');
+            this.state.filters.leadCategory = status;
+            
+            const selectedText = $(e.currentTarget).text();
+            this.elements.statusDropdownText.text(selectedText);
+            this.elements.statusFilterDropdown.removeClass('show');
+            
+            // Reset pagination when filter changes
+            this.state.pagination.currentPage = 1;
+            this.state.pagination.hasMore = true;
+            
+            if (window.app && typeof window.app.loadConversations === 'function') {
+                window.app.loadConversations(true, true); // true = reset pagination, true = show loading
+            } else {
+                console.warn("window.app nu este disponibil sau nu are metoda loadConversations");
+            }
+        });
+
+        // Agent Filter Dropdown Button - FIXED
+        $('#agentFilterDropdownButton').on('click', (e) => {
+            e.stopPropagation();
+            $('#agentFilterDropdown').toggleClass('show');
+        });
+
+        // Agent Filter Dropdown Items
+        $('#agentFilterDropdown').on('click', '.status-dropdown-item', (e) => {
+            e.stopPropagation();
+            const agentFilter = $(e.currentTarget).data('agent');
+            this.state.filters.agent = agentFilter || 'all';
+            
+            const selectedText = $(e.currentTarget).text().trim();
+            $('.agent-filter-dropdown-text').text(selectedText);
+            
+            // Adaugă clasa active pe elementul selectat
+            $('#agentFilterDropdown .status-dropdown-item').removeClass('active');
+            $(e.currentTarget).addClass('active');
+            $('#agentFilterDropdown').removeClass('show');
+            
+            console.log(`🔍 Filtru agent selectat: ${this.state.filters.agent} (${selectedText})`);
+            
+            // Reset pagination when filter changes
+            this.state.pagination.currentPage = 1;
+            this.state.pagination.hasMore = true;
+            
+            if (window.app && typeof window.app.loadConversations === 'function') {
+                window.app.loadConversations(true, true); // true = reset pagination, true = show loading
+            } else {
+                console.warn("window.app nu este disponibil sau nu are metoda loadConversations");
+            }
+        });
+
+        // Conversation selection
+        this.elements.conversationsList.on('click', '.conversation-item', (e) => {
+            const conversationId = $(e.currentTarget).data('conversation-id');
+            this.selectConversation(conversationId);
+        });
+
+        // Category dropdown
+        this.elements.statusBtn.on('click', (e) => {
+            e.stopPropagation();
+            this.elements.statusDropdown.toggle();
+        });
+
+        this.elements.statusDropdown.on('click', '.status-dropdown-item', async (e) => {
+            e.stopPropagation();
+            const status = $(e.currentTarget).data('status');
+            await this.changeConversationStatus(status);
+            this.elements.statusDropdown.hide();
+        });
+
+        // Agent Assignment
+        this.elements.agentBtn.on('click', (e) => {
+            e.stopPropagation();
+            this.elements.agentDropdown.toggle();
+        });
+
+        this.elements.agentDropdown.on('click', '.agent-dropdown-item', async (e) => {
+            e.stopPropagation();
+            const agentId = $(e.currentTarget).data('agent');
+            await this.assignConversationAgent(agentId);
+            this.elements.agentDropdown.hide();
+        });
+
+        $(document).on('click', () => {
+            this.elements.statusDropdown.hide();
+            this.elements.agentDropdown.hide();
+            this.elements.statusFilterDropdown.removeClass('show');
+            $('#agentFilterDropdown').removeClass('show'); // ADDED
+            this.elements.contextMenu.hide(); // FIXED
+            this.hideClientInfoPanel();
+        });
+
+        // Prevent closing when clicking inside certain elements
+        this.elements.statusDropdownButton.on('click', e => e.stopPropagation());
+        this.elements.clientInfoPanel.on('click', e => e.stopPropagation());
+
+        // Message input
+        this.elements.messageInput.on('input', () => {
+            this.autoResizeTextarea();
+            this.updateSendExperience();
+        });
+
+        this.elements.messageInput.on('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                if (!this.elements.sendBtn.is(':disabled')) {
+                    this.sendMessage();
+                }
+            }
+        });
+
+        // Send button
+        this.elements.sendBtn.on('click', () => {
+            this.sendMessage();
+        });
+
+        // Template button (dacă există în HTML)
+        if (this.elements.templateBtn && this.elements.templateBtn.length > 0) {
+            this.elements.templateBtn.on('click', () => {
+                this.sendTemplateMessage();
+            });
+        }
+
+        // Quick actions
+        this.elements.quickActions.on('click', (e) => {
+            const $quickAction = $(e.currentTarget);
+            if ($quickAction.hasClass('disabled')) return;
+            
+            const message = $quickAction.data('message');
+            this.elements.messageInput.val(message);
+            this.autoResizeTextarea();
+            this.updateSendExperience();
+            this.elements.messageInput.focus();
+        });
+
+        // Mobile back button
+        $('#mobileBackBtn').on('click', () => {
+            $('#chatArea').removeClass('mobile-active');
+            $('#sidebar').removeClass('mobile-hidden');
+            
+            // Resetează scroll-ul la lista de conversații
+            setTimeout(() => {
+                this.elements.conversationsList.scrollTop(
+                    $(`.conversation-item[data-conversation-id="${this.state.currentConversation?.id}"]`).position()?.top || 0
+                );
+            }, 300);
+        });
+
+        // Context menu
+        $(document).on('contextmenu', '.conversation-item', (e) => {
+            e.preventDefault();
+            const conversationId = $(e.currentTarget).data('conversation-id');
+            this.showContextMenu(e.pageX, e.pageY, conversationId);
+        });
+
+        // Context menu actions
+        this.elements.contextMenu.on('click', '.context-menu-item', async (e) => {
+            const action = $(e.currentTarget).data('action');
+            await this.handleContextAction(action);
+            this.elements.contextMenu.hide();
+        });
+
+        // Refresh
+        this.elements.refreshBtn.on('click', () => this.refreshData());
+
+        // Settings
+        $('#settingsBtn').on('click', () => this.showSettings());
+        $('#closeModal, #cancelSettings').on('click', () => this.hideSettings());
+        $('#saveSettings').on('click', () => this.saveSettings());
+
+        // Client Info Panel events
+        this.elements.infoBtn.on('click', (e) => {
+            e.stopPropagation();
+            this.showClientInfoPanel();
+        });
+        this.elements.closeInfoPanel.on('click', () => this.hideClientInfoPanel());
+
+        // Lightbox events
+        $('#closeLightbox, #closeLightbox').on('click', () => this.hideImageLightbox());
+        $('#imageLightbox').on('click', (e) => {
+            if ($(e.target).is('#imageLightbox')) {
+                this.hideImageLightbox();
+            }
+        });
+
+        // Delegate click for all images in messages
+        this.elements.messagesContainer.on('click', '.attachment-image, .chat-image', (e) => {
+            const $img = $(e.currentTarget);
+            const src = $img.data('src') || $img.attr('src');
+            if (src && !$img.hasClass('image-error')) {
+                this.showImageLightbox(src);
+            }
+        });
+
+        // Error handling for images
+        this.elements.messagesContainer.on('error', '.attachment-image, .chat-image', (e) => {
+            const $img = $(e.currentTarget);
+            $img.addClass('image-error');
+            $img.attr('alt', 'Imagine indisponibilă');
+            console.warn('Eroare la încărcarea imaginii:', $img.attr('src'));
+        });
+
+        // Bind save/cancel events for editable fields
+        this.elements.infoPanelContent.on('click', '.edit-save-btn', async (e) => {
+            const $btn = $(e.currentTarget);
+            const fieldName = $btn.data('field');
+            await this.saveFieldEdit(fieldName);
+        });
+
+        this.elements.infoPanelContent.on('click', '.edit-cancel-btn', (e) => {
+            const $btn = $(e.currentTarget);
+            const fieldName = $btn.data('field');
+            this.cancelFieldEdit(fieldName);
+        });
+
+        // Infinite scroll pentru conversații
+        this.elements.conversationsList.on('scroll', Utils.debounce(() => {
+            const element = this.elements.conversationsList[0];
+            const scrollPosition = element.scrollTop + element.clientHeight;
+            const scrollHeight = element.scrollHeight;
+            const distanceFromBottom = scrollHeight - scrollPosition;
+            
+            // Dacă suntem aproape de final (în ultimii 100px) și nu încărcăm deja
+            if (distanceFromBottom < 100 && 
+                this.state.pagination.hasMore && 
+                !this.state.pagination.isLoading &&
+                this.state.conversations.length > 0) {
+                console.log(`📜 Scroll detectat aproape de final (${distanceFromBottom}px de jos), încarcă mai multe conversații...`);
+                this.loadMoreConversations();
+            }
+        }, 200));
+
+        // Adaugă suport pentru zoom cu scroll/pinch pe imagini în lightbox
+        $(document).on('wheel', '#lightboxImage', function(e) {
+            e.preventDefault();
+            
+            const $img = $(this);
+            const currentWidth = $img.width();
+            const delta = e.originalEvent.deltaY;
+            const scaleFactor = delta > 0 ? 0.9 : 1.1;
+            const newWidth = currentWidth * scaleFactor;
+            
+            // Limitează zoom între 50% și 300%
+            const originalWidth = this.naturalWidth;
+            const minWidth = originalWidth * 0.5;
+            const maxWidth = originalWidth * 3;
+            
+            if (newWidth >= minWidth && newWidth <= maxWidth) {
+                $img.css({
+                    'max-width': newWidth + 'px',
+                    'max-height': 'none',
+                    'transition': 'all 0.1s ease'
+                });
+            }
+        });
+    }
+
+    // METODĂ NOUĂ PENTRU FIX SCROLL MOBIL
+    enableMobileScroll() {
+        // Detectează dispozitiv mobil
+        const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        
+        if (isMobile) {
+            // Fix pentru scroll în lista de conversații
+            this.elements.conversationsList.on('touchstart', function(e) {
+                const touch = e.originalEvent.touches[0];
+                this.startY = touch.pageY;
+                this.startScrollTop = this.scrollTop;
+            });
+            
+            this.elements.conversationsList.on('touchmove', function(e) {
+                if (!this.startY) return;
+                
+                const touch = e.originalEvent.touches[0];
+                const deltaY = this.startY - touch.pageY;
+                
+                // Previne scroll bounce la capete
+                if ((this.scrollTop === 0 && deltaY < 0) || 
+                    (this.scrollTop + this.clientHeight >= this.scrollHeight && deltaY > 0)) {
+                    e.preventDefault();
+                }
+            });
+            
+            // Fix pentru scroll în containerul de mesaje
+            this.elements.messagesContainer.on('touchstart', function(e) {
+                const touch = e.originalEvent.touches[0];
+                this.startY = touch.pageY;
+                this.startScrollTop = this.scrollTop;
+            });
+            
+            this.elements.messagesContainer.on('touchmove', function(e) {
+                if (!this.startY) return;
+                
+                const touch = e.originalEvent.touches[0];
+                const deltaY = this.startY - touch.pageY;
+                
+                if ((this.scrollTop === 0 && deltaY < 0) || 
+                    (this.scrollTop + this.clientHeight >= this.scrollHeight && deltaY > 0)) {
+                    e.preventDefault();
+                }
+            });
+            
+            // Previne scroll pe body când atingi elementele scrollabile
+            $('body').on('touchmove', function(e) {
+                if (!$(e.target).closest('.conversations-list, .messages-container').length) {
+                    e.preventDefault();
+                }
+            });
+        }
+    }
+
+    // METODĂ NOUĂ PENTRU PULL TO REFRESH PE MOBIL
+    enableMobilePullToRefresh() {
+        const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        
+        if (isMobile) {
+            let startY = 0;
+            let currentY = 0;
+            let pulling = false;
+            
+            const pullToRefreshThreshold = 80;
+            const $pullIndicator = $('<div class="pull-to-refresh-indicator"><i class="fas fa-arrow-down"></i> Trage pentru a reîmprospăta</div>');
+            this.elements.conversationsList.before($pullIndicator);
+            
+            this.elements.conversationsList.on('touchstart', (e) => {
+                if (this.elements.conversationsList[0].scrollTop === 0) {
+                    startY = e.touches[0].pageY;
+                    pulling = true;
+                }
+            });
+            
+            this.elements.conversationsList.on('touchmove', (e) => {
+                if (!pulling) return;
+                
+                currentY = e.touches[0].pageY;
+                const distance = currentY - startY;
+                
+                if (distance > 0 && this.elements.conversationsList[0].scrollTop === 0) {
+                    e.preventDefault();
+                    
+                    const translateY = Math.min(distance * 0.5, pullToRefreshThreshold);
+                    $pullIndicator.css('transform', `translateY(${translateY}px)`);
+                    
+                    if (distance > pullToRefreshThreshold) {
+                        $pullIndicator.html('<i class="fas fa-sync fa-spin"></i> Eliberează pentru a reîmprospăta');
+                    }
+                }
+            });
+            
+            this.elements.conversationsList.on('touchend', async () => {
+                if (!pulling) return;
+                
+                const distance = currentY - startY;
+                
+                if (distance > pullToRefreshThreshold) {
+                    $pullIndicator.html('<i class="fas fa-sync fa-spin"></i> Se reîmprospătează...');
+                    
+                    if (window.app) {
+                        await window.app.loadConversations(true, false); // Background refresh
+                    }
+                }
+                
+                $pullIndicator.css('transform', 'translateY(0)');
+                setTimeout(() => {
+                    $pullIndicator.html('<i class="fas fa-arrow-down"></i> Trage pentru a reîmprospăta');
+                }, 300);
+                
+                pulling = false;
+                startY = 0;
+                currentY = 0;
+            });
+        }
+    }
+
+    toggleClearButton() {
+        if (this.elements.searchInput.val()) {
+            this.elements.clearSearch.show();
+        } else {
+            this.elements.clearSearch.hide();
+        }
+    }
+
+    autoResizeTextarea() {
+        const textarea = this.elements.messageInput[0];
+        textarea.style.height = 'auto';
+        textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+    }
+
+    updateSendExperience() {
+        const conversation = this.state.currentConversation;
+        if (!conversation) {
+            this.elements.messageInput.prop('disabled', true).attr('placeholder', 'Selectează o conversație');
+            this.elements.sendBtn.prop('disabled', true);
+            this.elements.quickActions.find('.quick-action').addClass('disabled');
+            return;
+        }
+
+        const now = new Date().getTime();
+        const twentyFourHoursInMs = 24 * 60 * 60 * 1000;
+        let isWithin24HourWindow = false;
+
+        // Check the timestamp of the last INCOMING message from the client
+        if (conversation.lastIncomingMessageTimestamp) {
+            const lastIncomingTime = new Date(conversation.lastIncomingMessageTimestamp).getTime();
+            isWithin24HourWindow = (now - lastIncomingTime) < twentyFourHoursInMs;
+        }
+
+        const hasText = this.elements.messageInput.val().trim().length > 0;
+
+        if (isWithin24HourWindow) {
+            this.elements.messageInput.prop('disabled', false).attr('placeholder', 'Scrie un mesaj...');
+            this.elements.sendBtn.prop('disabled', !hasText);
+            this.elements.quickActions.find('.quick-action').removeClass('disabled');
+            this.elements.sendBtn.html('<i class="fas fa-paper-plane"></i>');
+        } else {
+            // Outside 24-hour window, must send a template
+            this.elements.messageInput.prop('disabled', false)
+                .attr('placeholder', 'Fereastră 24h închisă. Se va trimite un mesaj template.');
+            this.elements.sendBtn.prop('disabled', false);
+            this.elements.quickActions.find('.quick-action').addClass('disabled');
+            this.elements.sendBtn.html('<i class="fas fa-envelope-open-text"></i>');
+        }
+    }
+
+    showContextMenu(x, y, conversationId) {
+        this.state.contextMenuConversationId = conversationId;
+        this.elements.contextMenu.css({
+            left: x + 'px',
+            top: y + 'px',
+            display: 'block'
+        });
+    }
+
+    async handleContextAction(action) {
+        const conversationId = this.state.contextMenuConversationId;
+        if (!conversationId) return;
+
+        switch (action) {
+            case 'reply':
+                this.selectConversation(conversationId);
+                this.elements.messageInput.focus();
+                break;
+            case 'change-status':
+                this.selectConversation(conversationId);
+                this.elements.statusBtn.click();
+                break;
+            case 'archive':
+                // Implement archive functionality
+                console.log('Archive conversation:', conversationId);
+                break;
+            case 'delete':
+                if (confirm('Sigur doriți să ștergeți această conversație?')) {
+                    try {
+                        await APIService.deleteConversation(conversationId);
+                        // Remove from state and refresh
+                        this.state.conversations = this.state.conversations.filter(c => c.id !== conversationId);
+                        this.renderConversations();
+                        if (this.state.currentConversation?.id === conversationId) {
+                            this.state.currentConversation = null;
+                            this.resetChatArea();
+                        }
+                    } catch (error) {
+                        alert('Eroare la ștergerea conversației');
+                    }
+                }
+                break;
+        }
+    }
+
+    resetChatArea() {
+        this.elements.chatHeader.addClass('d-none');
+        this.elements.inputArea.addClass('d-none');
+        this.elements.messagesContainer.html(`
+            <div class="empty-state">
+                <i class="fas fa-comments"></i>
+                <h3>Business Messaging Dashboard</h3>
+                <p>Selectează o conversație pentru a începe să trimiți mesaje</p>
+            </div>
+        `);
+        
+        // Pe mobil, revino la lista de conversații
+        const isMobile = window.innerWidth <= 768;
+        if (isMobile) {
+            $('#chatArea').removeClass('mobile-active');
+            $('#sidebar').removeClass('mobile-hidden');
+        }
+    }
+
+    refreshData() {
+        if (window.app && typeof window.app.loadConversations === 'function') {
+            // Reset și reîncarcă de la început cu loading
+            window.app.loadConversations(true, true);
+        }
+    }
+
+    showSettings() {
+        this.elements.settingsModal.show();
+        // Load current settings
+        $('#desktopNotifications').prop('checked', this.state.settings.notifications);
+        $('#soundNotifications').prop('checked', this.state.settings.sounds);
+        $('#refreshInterval').val(this.state.settings.refreshInterval / 1000);
+        $('#messageCheckInterval').val((this.state.settings.messageCheckInterval || 5000) / 1000);
+    }
+
+    hideSettings() {
+        this.elements.settingsModal.hide();
+    }
+
+    saveSettings() {
+        this.state.settings.notifications = $('#desktopNotifications').is(':checked');
+        this.state.settings.sounds = $('#soundNotifications').is(':checked');
+        this.state.settings.refreshInterval = parseInt($('#refreshInterval').val()) * 1000;
+        this.state.settings.messageCheckInterval = parseInt($('#messageCheckInterval').val() || 5) * 1000;
+        this.state.saveSettings();
+        this.hideSettings();
+        // Restart timers with new intervals
+        if (window.app) {
+            window.app.startRefreshTimer();
+            window.app.startMessagePolling();
+        }
+    }
+
+    async selectConversation(conversationId) {
+        const conversation = this.state.conversations.find(c => c.id === conversationId);
+        if (!conversation) return;
+
+        // Previne schimbarea rapidă între conversații
+        if (this.isLoadingMessages) {
+            console.log('⏳ Se încarcă deja mesaje, așteptați...');
+            return;
+        }
+
+        const hadUnreadMessages = conversation.unreadCount > 0;
+
+        this.state.currentConversation = conversation;
+        
+        $('.conversation-item').removeClass('active');
+        $(`.conversation-item[data-conversation-id="${conversationId}"]`).addClass('active');
+
+        this.elements.chatHeader.removeClass('d-none');
+        this.elements.inputArea.removeClass('d-none');
+
+        // LOGICĂ PENTRU MOBIL - TRANZIȚIE ÎNTRE SIDEBAR ȘI CHAT
+        const isMobile = window.innerWidth <= 768;
+        if (isMobile) {
+            // Adaugă clase pentru tranziție pe mobil
+            $('#sidebar').addClass('mobile-hidden');
+            $('#chatArea').addClass('mobile-active');
+            
+            // Focus pe input după tranziție
+            setTimeout(() => {
+                this.elements.messageInput.focus();
+            }, 300);
+        }
+
+        this.updateChatHeader(conversation);
+        this.populateClientInfoPanel(conversation);
+
+        await this.loadMessages(conversationId);
+
+        if (hadUnreadMessages) {
+            try {
+                // CORECȚIA: Folosim conversation.id (care este leadId) în loc de conversationId
+                await APIService.markMessagesAsRead(conversation.id);
+                conversation.unreadCount = 0;
+                this.renderConversations();
+                console.log(`📖 Mesaje marcate ca citite și UI actualizat pentru ${conversationId}`);
+            } catch (error) {
+                console.error(`Eroare la marcarea mesajelor ca citite pentru ${conversationId}:`, error);
+            }
+        }
+        this.updateSendExperience();
+    }
+
+    updateChatHeader(conversation) {
+        this.elements.clientAvatar.text(Utils.getInitials(conversation.name));
+        const statusKey = Utils.getLeadStatusFromValue(conversation.status);
+        this.elements.clientAvatar.removeClass().addClass(`client-avatar status-${statusKey}`);
+
+        this.elements.clientName.text(conversation.name);
+        
+        const businessUnitOwnerInfo = $('#businessUnitOwnerInfo');
+        const businessUnitText = $('#businessUnitText');
+        const ownerText = $('#ownerText');
+        
+        businessUnitText.text('');
+        ownerText.text('');
+        
+        if (conversation.businessUnit || conversation.ownerName) {
+            businessUnitOwnerInfo.show();
+            
+            if (conversation.businessUnit) {
+                businessUnitText.text(conversation.businessUnit);
+            }
+            
+            if (conversation.ownerName) {
+                ownerText.text(conversation.businessUnit ? ` / ${conversation.ownerName}` : conversation.ownerName);
+            }
+        } else {
+            businessUnitOwnerInfo.hide();
+        }
+        
+        this.elements.statusText.text(conversation.status);
+
+        if (statusKey) {
+            const statusLabel = Utils.getLeadStatusLabel(statusKey);
+            this.elements.statusBadge.text(statusLabel);
+            this.elements.statusBadge.removeClass().addClass(`status-badge-header status-${statusKey}`);
+            this.elements.statusBadge.show();
+        } else {
+            this.elements.statusBadge.hide();
+        }
+
+        this.updateAgentBadgeInStatus(conversation);
+    }
+
+    showClientInfoPanel() {
+        if (this.state.currentConversation && this.elements.clientInfoPanel) {
+            this.populateClientInfoPanel(this.state.currentConversation);
+            this.elements.clientInfoPanel.addClass('show');
+        }
+    }
+
+    hideClientInfoPanel() {
+        if (this.elements.clientInfoPanel) {
+            this.elements.clientInfoPanel.removeClass('show');
+        }
+    }
+
+    // UPDATED populateClientInfoPanel WITH EDITABLE FIELDS
+    populateClientInfoPanel(conversation) {
+        if (!conversation) {
+            this.elements.infoPanelContent.html('<div class="empty-state"><p>Selectează o conversație.</p></div>');
+            return;
+        }
+
+        const statusKey = Utils.getLeadStatusFromValue(conversation.status);
+        const statusLabel = Utils.getLeadStatusLabel(statusKey);
+
+        let agentName = 'Neatribuit';
+        if (conversation.assignedAgent) {
+            const agent = this.state.agents.find(a => a.id === conversation.assignedAgent);
+            agentName = agent ? agent.name : (conversation.assignedAgentName || 'Agent necunoscut');
+        }
+
+        const html = `
+            <div class="info-section">
+                <h4>Detalii Contact</h4>
+                <div class="info-item">
+                    <i class="fas fa-user"></i>
+                    <div class="info-value">
+                        ${conversation.name || 'Nume indisponibil'}
+                    </div>
+                </div>
+                <div class="info-item">
+                    <i class="fas fa-phone"></i>
+                    <div class="info-value">
+                        ${conversation.phone || 'Telefon indisponibil'}
+                    </div>
+                </div>
+                 <div class="info-item">
+                    <i class="fas fa-envelope"></i>
+                    <div class="info-value">${conversation.email || 'Email indisponibil'}</div>
+                </div>
+            </div>
+            <div class="info-section">
+                <h4>Status Conversație</h4>
+                <div class="info-item">
+                    <i class="fas fa-tag"></i>
+                    <div class="info-value">
+                        <span class="status-badge-info status-${statusKey}">${statusLabel}</span>
+                    </div>
+                </div>
+                <div class="info-item">
+                    <i class="fas fa-user-shield"></i>
+                    <div class="info-value">${agentName}</div>
+                </div>
+            </div>
+             <div class="info-section">
+                <h4>Informații Lead</h4>
+                <div class="info-item">
+                    <i class="fas fa-briefcase"></i>
+                    <div class="info-value">${conversation.businessUnit || 'Indisponibil'}</div>
+                </div>
+                <div class="info-item">
+                    <i class="fas fa-user-tie"></i>
+                    <div class="info-value">${conversation.ownerName || 'Indisponibil'}</div>
+                </div>
+            </div>
+            <div class="info-section">
+                <h4>Informații Financiare</h4>
+                <div class="info-item">
+                    <i class="fas fa-check-circle"></i>
+                    <div class="info-value-editable" id="edit-confirminterest">
+                        <select data-field="confirminterest" ${this.editingFields.has('confirminterest') ? '' : 'disabled'}>
+                            <option value="true" ${conversation.confirmInterest === true ? 'selected' : ''}>Da</option>
+                            <option value="false" ${conversation.confirmInterest === false ? 'selected' : ''}>Nu</option>
+                        </select>
+                        ${!this.editingFields.has('confirminterest') ? 
+                            `<button class="edit-save-btn" data-field="confirminterest">Editează</button>` :
+                            `<div class="field-actions">
+                                <button class="edit-save-btn" data-field="confirminterest">Salvează</button>
+                                <button class="edit-cancel-btn" data-field="confirminterest">Anulează</button>
+                            </div>`
+                        }
+                    </div>
+                </div>
+                <div class="info-item">
+                    <i class="fas fa-file-invoice-dollar"></i>
+                    <div class="info-value-editable" id="edit-new_tipvenit">
+                        <input type="text" data-field="new_tipvenit" value="${conversation.tipVenit || ''}" 
+                               placeholder="Tip venit" ${this.editingFields.has('new_tipvenit') ? '' : 'disabled'}>
+                        ${!this.editingFields.has('new_tipvenit') ? 
+                            `<button class="edit-save-btn" data-field="new_tipvenit">Editează</button>` :
+                            `<div class="field-actions">
+                                <button class="edit-save-btn" data-field="new_tipvenit">Salvează</button>
+                                <button class="edit-cancel-btn" data-field="new_tipvenit">Anulează</button>
+                            </div>`
+                        }
+                    </div>
+                </div>
+                <div class="info-item">
+                    <i class="fas fa-money-bill-wave"></i>
+                    <div class="info-value-editable" id="edit-new_salary">
+                        <input type="number" data-field="new_salary" value="${conversation.salary || ''}" 
+                               placeholder="Salariu net" ${this.editingFields.has('new_salary') ? '' : 'disabled'}>
+                        ${!this.editingFields.has('new_salary') ? 
+                            `<button class="edit-save-btn" data-field="new_salary">Editează</button>` :
+                            `<div class="field-actions">
+                                <button class="edit-save-btn" data-field="new_salary">Salvează</button>
+                                <button class="edit-cancel-btn" data-field="new_salary">Anulează</button>
+                            </div>`
+                        }
+                    </div>
+                </div>
+            </div>
+            <div class="info-section">
+                <h4>Nevoi și Comentarii</h4>
+                <div class="info-item">
+                    <i class="fas fa-check-square"></i>
+                    <div class="info-value-editable" id="edit-new_rectificarebc">
+                        <select data-field="new_rectificarebc" ${this.editingFields.has('new_rectificarebc') ? '' : 'disabled'}>
+                            <option value="">Selectează</option>
+                            <option value="true" ${conversation.rectificareBC === true ? 'selected' : ''}>Da</option>
+                            <option value="false" ${conversation.rectificareBC === false ? 'selected' : ''}>Nu</option>
+                        </select>
+                        ${!this.editingFields.has('new_rectificarebc') ? 
+                            `<button class="edit-save-btn" data-field="new_rectificarebc">Editează</button>` :
+                            `<div class="field-actions">
+                                <button class="edit-save-btn" data-field="new_rectificarebc">Salvează</button>
+                                <button class="edit-cancel-btn" data-field="new_rectificarebc">Anulează</button>
+                            </div>`
+                        }
+                    </div>
+                </div>
+                <div class="info-item">
+                    <i class="fas fa-heart"></i>
+                    <div class="info-value-editable" id="edit-new_nevoipersonale">
+                        <input type="text" data-field="new_nevoipersonale" value="${conversation.nevoiPersonale || ''}" 
+                               placeholder="Nevoi personale" ${this.editingFields.has('new_nevoipersonale') ? '' : 'disabled'}>
+                        ${!this.editingFields.has('new_nevoipersonale') ? 
+                            `<button class="edit-save-btn" data-field="new_nevoipersonale">Editează</button>` :
+                            `<div class="field-actions">
+                                <button class="edit-save-btn" data-field="new_nevoipersonale">Salvează</button>
+                                <button class="edit-cancel-btn" data-field="new_nevoipersonale">Anulează</button>
+                            </div>`
+                        }
+                    </div>
+                </div>
+                <div class="info-item">
+                    <i class="fas fa-home"></i>
+                    <div class="info-value-editable" id="edit-new_ipotecar">
+                        <select data-field="new_ipotecar" ${this.editingFields.has('new_ipotecar') ? '' : 'disabled'}>
+                            <option value="">Selectează</option>
+                            <option value="true" ${conversation.ipotecar === true ? 'selected' : ''}>Da</option>
+                            <option value="false" ${conversation.ipotecar === false ? 'selected' : ''}>Nu</option>
+                        </select>
+                        ${!this.editingFields.has('new_ipotecar') ? 
+                            `<button class="edit-save-btn" data-field="new_ipotecar">Editează</button>` :
+                            `<div class="field-actions">
+                                <button class="edit-save-btn" data-field="new_ipotecar">Salvează</button>
+                                <button class="edit-cancel-btn" data-field="new_ipotecar">Anulează</button>
+                            </div>`
+                        }
+                    </div>
+                </div>
+                <div class="info-item">
+                    <i class="fas fa-comment-dots"></i>
+                    <div class="info-value-editable" id="edit-qualificationcomments">
+                        <textarea data-field="qualificationcomments" placeholder="Comentarii de calificare" 
+                                  ${this.editingFields.has('qualificationcomments') ? '' : 'disabled'}>${conversation.qualificationComments || ''}</textarea>
+                        ${!this.editingFields.has('qualificationcomments') ? 
+                            `<button class="edit-save-btn" data-field="qualificationcomments">Editează</button>` :
+                            `<div class="field-actions">
+                                <button class="edit-save-btn" data-field="qualificationcomments">Salvează</button>
+                                <button class="edit-cancel-btn" data-field="qualificationcomments">Anulează</button>
+                            </div>`
+                        }
+                    </div>
+                </div>
+            </div>
+        `;
+
+        this.elements.infoPanelContent.html(html);
+    }
+
+    // NEW METHODS FOR HANDLING FIELD EDITS
+    async saveFieldEdit(fieldName) {
+        if (!this.state.currentConversation) return;
+
+        const $container = $(`#edit-${fieldName}`);
+        const $input = $container.find('input, select, textarea');
+        let value = $input.val();
+
+        // Convert string values to appropriate types
+        if ($input.is('select') && (value === 'true' || value === 'false')) {
+            value = value === 'true';
+        } else if ($input.attr('type') === 'number' && value) {
+            value = parseFloat(value);
+        }
+
+        if (this.editingFields.has(fieldName)) {
+            // Save mode
+            try {
+                await APIService.updateLeadField(this.state.currentConversation.id, fieldName, value);
+                
+                // Update local state
+                const fieldMapping = {
+                    'new_rectificarebc': 'rectificareBC',
+                    'new_nevoipersonale': 'nevoiPersonale',
+                    'new_ipotecar': 'ipotecar',
+                    'confirminterest': 'confirmInterest',
+                    'qualificationcomments': 'qualificationComments',
+                    'new_tipvenit': 'tipVenit',
+                    'new_salary': 'salary'
+                };
+                
+                const localFieldName = fieldMapping[fieldName] || fieldName;
+                this.state.currentConversation[localFieldName] = value;
+                
+                // Update conversation in list
+                const convIndex = this.state.conversations.findIndex(
+                    c => c.id === this.state.currentConversation.id
+                );
+                if (convIndex !== -1) {
+                    this.state.conversations[convIndex][localFieldName] = value;
+                }
+                
+                this.editingFields.delete(fieldName);
+                this.showNotification('Succes', `Câmpul a fost actualizat cu succes.`);
+            } catch (error) {
+                this.showNotification('Eroare', `Nu s-a putut actualiza câmpul: ${error.message}`);
+            }
+        } else {
+            // Edit mode
+            this.editingFields.add(fieldName);
+            $input.prop('disabled', false);
+            $input.focus();
+        }
+        
+        // Re-render the panel
+        this.populateClientInfoPanel(this.state.currentConversation);
+    }
+
+    cancelFieldEdit(fieldName) {
+        this.editingFields.delete(fieldName);
+        this.populateClientInfoPanel(this.state.currentConversation);
+    }
+
+    updateAgentBadgeInStatus(conversation) {
+        const statusContainer = this.elements.clientStatus;
+        
+        statusContainer.find('.agent-badge').remove();
+        
+        if (conversation.assignedAgent) {
+            const agent = this.state.agents.find(a => a.id === conversation.assignedAgent);
+            const agentName = agent?.name || conversation.assignedAgentName || 'Agent necunoscut';
+            const normalizedConvAgentId = Utils.normalizeId(conversation.assignedAgent);
+            const normalizedCurrentUserId = Utils.normalizeId(this.state.currentUser?.id);
+            const isCurrentUser = normalizedConvAgentId === normalizedCurrentUserId;
+            const badgeClass = isCurrentUser ? 'agent-badge self' : 'agent-badge assigned';
+            const badgeText = isCurrentUser ? 'Eu' : (agent?.initials || Utils.getInitials(agentName));
+            const agentBadge = $(`<span class="${badgeClass}" title="Atribuit către: ${agentName}">${badgeText}</span>`);
+            statusContainer.append(agentBadge);
+        }
+    }
+
+    // FIXED changeConversationStatus
+    async changeConversationStatus(status) {
+        if (!this.state.currentConversation) return;
+
+        try {
+            // status vine ca string (ex: 'nu-raspunde') din dropdown
+            await APIService.updateLeadStatus(this.state.currentConversation.id, status);
+            
+            // Pentru stocarea locală, găsim valoarea numerică
+            const numericStatus = Object.keys(LEAD_STATUS_MAPPING).find(
+                key => LEAD_STATUS_MAPPING[key] === status
+            ) || '100000002';
+            
+            this.state.currentConversation.status = numericStatus;
+            const convIndex = this.state.conversations.findIndex(
+                c => c.id === this.state.currentConversation.id
+            );
+            if (convIndex !== -1) {
+                this.state.conversations[convIndex].status = numericStatus;
+            }
+
+            this.updateChatHeader(this.state.currentConversation);
+            this.renderConversations();
+            this.populateClientInfoPanel(this.state.currentConversation);
+
+            console.log(`✅ Statusul actualizat la: ${Utils.getLeadStatusLabel(status)}`);
+
+        } catch (error) {
+            console.error('Eroare la schimbarea statusului:', error);
+            alert('Eroare la actualizarea statusului. Încercați din nou.');
+        }
+    }
+
+    async assignConversationAgent(agentId) {
+        if (!this.state.currentConversation) return;
+
+        try {
+            await APIService.assignAgent(this.state.currentConversation.id, agentId);
+
+            this.state.currentConversation.assignedAgent = agentId;
+            const agent = this.state.agents.find(a => a.id === agentId);
+            this.state.currentConversation.assignedAgentName = agent ? agent.name : 'N/A';
+
+            const convIndex = this.state.conversations.findIndex(
+                c => c.id === this.state.currentConversation.id
+            );
+            if (convIndex !== -1) {
+                this.state.conversations[convIndex].assignedAgent = agentId;
+                this.state.conversations[convIndex].assignedAgentName = agent ? agent.name : 'N/A';
+            }
+
+            this.updateChatHeader(this.state.currentConversation);
+            this.renderConversations();
+            this.populateClientInfoPanel(this.state.currentConversation);
+
+            console.log(`✅ Conversație atribuită agentului: ${agentId}`);
+
+        } catch (error) {
+            console.error('Eroare la atribuirea agentului:', error);
+            alert('Eroare la atribuirea agentului. Încercați din nou.');
+        }
+    }
+
+    renderMessages(messages) {
+        if (!messages || messages.length === 0) {
+            this.elements.messagesContainer.html(`
+                <div class="empty-state">
+                    <i class="fas fa-comments"></i>
+                    <h3>Niciun mesaj</h3>
+                    <p>Trimite un mesaj pentru a începe conversația.</p>
+                </div>
+            `);
+            return;
+        }
+
+        const messagesHtml = messages.map(msg => this.getMessageHTML(msg)).join('');
+        this.elements.messagesContainer.html(messagesHtml);
+    }
+
+    getMessageHTML(message) {
+        const time = Utils.formatTime(message.timestamp);
+        const messageClass = `message ${message.type}`;
+        
+        let contentHtml;
+        
+        // Verifică mai întâi dacă întregul mesaj este un URL către imagine sau PDF
+        const urlRegex = /^(https?:\/\/[^\s]+)$/;
+        const trimmedContent = message.content.trim();
+        const isOnlyUrl = urlRegex.test(trimmedContent);
+        
+        if (isOnlyUrl) {
+            // Mesajul conține doar un URL
+            if (Utils.isImageUrl(trimmedContent)) {
+                contentHtml = `
+                    <div class="attachment">
+                        <img src="${trimmedContent}" alt="Imagine primită" class="chat-image attachment-image" 
+                             data-src="${trimmedContent}" loading="lazy"
+                             style="cursor: pointer;"
+                             onerror="this.onerror=null; this.src='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjIwMCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iMjAwIiBoZWlnaHQ9IjIwMCIgZmlsbD0iI2Y0ZjRmNCIvPjx0ZXh0IHg9IjUwJSIgeT0iNTAlIiBmaWxsPSIjOTk5IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBkeT0iLjNlbSIgZm9udC1mYW1pbHk9InNhbnMtc2VyaWYiIGZvbnQtc2l6ZT0iMTQiPkltYWdpbmUgaW5kaXNwb25pYmlsxIM8L3RleHQ+PC9zdmc+'; this.style.cursor='default';">
+                    </div>`;
+            } else if (Utils.isPdfUrl(trimmedContent)) {
+                const fileName = decodeURIComponent(trimmedContent.split('/').pop().split('?')[0]);
+                contentHtml = `
+                    <div class="attachment">
+                        <a href="${trimmedContent}" target="_blank" rel="noopener noreferrer" class="attachment-pdf" 
+                           title="Deschide PDF: ${fileName}">
+                            <i class="fas fa-file-pdf"></i>
+                            <span>${Utils.truncateText(fileName, 30)}</span>
+                            <i class="fas fa-external-link-alt ms-2"></i>
+                        </a>
+                    </div>`;
+            } else {
+                // URL normal
+                contentHtml = `<a href="${trimmedContent}" target="_blank" rel="noopener noreferrer">${trimmedContent}</a>`;
+            }
+        } else {
+            // Mesajul poate conține text cu URL-uri încorporate
+            // Folosim linkify care gestionează deja imagini și PDF-uri în text
+            contentHtml = Utils.linkify(message.content);
+        }
+
+        let senderInfo = '';
+        if (message.type === 'outgoing' && message.sentBy && message.sentBy.toLowerCase() !== 'client') {
+            senderInfo = `<div class="message-sender">trimis de ${$('<div>').text(message.sentBy).html()}</div>`;
+        }
+
+        // Status icons pentru mesaje trimise
+        let statusIcon = '';
+        if (message.type === 'outgoing') {
+            const iconClass = message.status === 'sent' ? 'fa-check-double' : 
+                             message.status === 'sending' ? 'fa-clock' : 
+                             message.status === 'failed' ? 'fa-exclamation-circle' : 'fa-check';
+            statusIcon = `<i class="message-status-icon fas ${iconClass} status-${message.status || 'sent'}"></i>`;
+        }
+
+        return `
+            <div class="${messageClass}" data-message-id="${message.id}">
+                <div class="message-bubble">
+                    <div class="message-content">
+                        ${contentHtml}
+                    </div>
+                    <div class="message-footer">
+                        <span class="message-time">${time}</span>
+                        ${statusIcon}
+                    </div>
+                    ${senderInfo}
+                </div>
+            </div>
+        `;
+    }
+
+    // ENHANCED showImageLightbox method
+    showImageLightbox(src) {
+        const $lightbox = $('#imageLightbox');
+        const $img = $('#lightboxImage');
+        const $loading = $('.lightbox-loading');
+        
+        // Verifică dacă elementul lightbox există, dacă nu, creează-l
+        if ($lightbox.length === 0) {
+            $('body').append(`
+                <div id="imageLightbox" style="display: none;">
+                    <div class="lightbox-content">
+                        <button id="closeLightbox" class="lightbox-close">&times;</button>
+                        <div class="lightbox-loading">
+                            <div class="spinner-border text-light" role="status">
+                                <span class="visually-hidden">Se încarcă...</span>
+                            </div>
+                        </div>
+                        <img id="lightboxImage" class="lightbox-image" style="display: none;">
+                    </div>
+                </div>
+            `);
+            
+            // Re-bind events pentru elementele noi
+            $('#closeLightbox').on('click', () => this.hideImageLightbox());
+            $('#imageLightbox').on('click', (e) => {
+                if ($(e.target).is('#imageLightbox')) {
+                    this.hideImageLightbox();
+                }
+            });
+        }
+        
+        // Reset și afișare loading
+        $('#lightboxImage').hide().attr('src', '');
+        $('.lightbox-loading').show();
+        $('#imageLightbox').css('display', 'flex').hide().fadeIn(200);
+        
+        // Previne scroll pe body când lightbox este deschis
+        $('body').css('overflow', 'hidden');
+        
+        // Load image
+        const img = new Image();
+        
+        img.onload = () => {
+            // Calculează dimensiunile optime pentru imagine
+            const maxWidth = window.innerWidth * 0.9;
+            const maxHeight = window.innerHeight * 0.9;
+            const aspectRatio = img.width / img.height;
+            
+            let displayWidth = img.width;
+            let displayHeight = img.height;
+            
+            if (displayWidth > maxWidth) {
+                displayWidth = maxWidth;
+                displayHeight = displayWidth / aspectRatio;
+            }
+            
+            if (displayHeight > maxHeight) {
+                displayHeight = maxHeight;
+                displayWidth = displayHeight * aspectRatio;
+            }
+            
+            $('.lightbox-loading').fadeOut(200, () => {
+                $('#lightboxImage').css({
+                    'max-width': displayWidth + 'px',
+                    'max-height': displayHeight + 'px'
+                }).attr('src', src).fadeIn(200);
+            });
+        };
+        
+        img.onerror = () => {
+            $('.lightbox-loading').html(`
+                <div class="text-light text-center">
+                    <i class="fas fa-exclamation-triangle fa-3x mb-3"></i>
+                    <p>Imaginea nu a putut fi încărcată</p>
+                    <button class="btn btn-secondary mt-2" onclick="$('#imageLightbox').fadeOut(200);">
+                        Închide
+                    </button>
+                </div>
+            `);
+        };
+        
+        img.src = src;
+        
+        // Adaugă suport pentru navigare cu tastatura
+        $(document).on('keydown.lightbox', (e) => {
+            if (e.key === 'Escape') {
+                this.hideImageLightbox();
+            }
+        });
+        
+        // Handle window resize pentru a gestiona corect trecerea între mobil și desktop
+        let resizeTimer;
+        $(window).on('resize', () => {
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {
+                const wasMobile = this.isMobile;
+                this.isMobile = window.innerWidth <= 768;
+                
+                // Dacă s-a schimbat de la mobil la desktop sau invers
+                if (wasMobile !== this.isMobile && !this.isMobile) {
+                    // Resetează clasele mobile când trecem la desktop
+                    $('#sidebar').removeClass('mobile-hidden');
+                    $('#chatArea').removeClass('mobile-active');
+                }
+            }, 250);
+        });
+        
+        // Setează flag-ul inițial pentru mobil
+        this.isMobile = window.innerWidth <= 768;
+    }
+
+    // ENHANCED hideImageLightbox method
+    hideImageLightbox() {
+        $('#imageLightbox').fadeOut(200, function() {
+            $('#lightboxImage').attr('src', '');
+            $('.lightbox-loading').show();
+            $('body').css('overflow', ''); // Restaurează scroll-ul
+        });
+        
+        // Elimină event listener pentru keyboard
+        $(document).off('keydown.lightbox');
+    }
+
+    async loadMessages(conversationId) {
+        try {
+            this.isLoadingMessages = true; // Setează flag-ul
+            this.showMessagesLoading();
+            
+            const messages = await APIService.loadMessages(conversationId);
+            this.state.messages[conversationId] = messages;
+
+            if (this.state.currentConversation && this.state.currentConversation.id === conversationId) {
+                let lastIncomingTs = null;
+                for (let i = messages.length - 1; i >= 0; i--) {
+                    if (messages[i].type === 'incoming') {
+                        lastIncomingTs = messages[i].timestamp;
+                        break;
+                    }
+                }
+                this.state.currentConversation.lastIncomingMessageTimestamp = lastIncomingTs;
+                console.log(`🕒 lastIncomingMessageTimestamp pentru ${conversationId} actualizat la: ${lastIncomingTs}`);
+                this.updateSendExperience();
+            }
+            
+            this.renderMessages(messages);
+            this.scrollToBottom();
+
+        } catch (error) {
+            console.error('Eroare la încărcarea mesajelor:', error);
+            this.showMessagesError();
+        } finally {
+            this.isLoadingMessages = false; // Resetează flag-ul
+        }
+    }
+
+    renderConversations() {
+        const filtered = this.getFilteredConversations();
+        
+        // Salvează poziția scroll-ului înainte de render
+        const scrollPosition = this.elements.conversationsList[0].scrollTop;
+        
+        let html = '';
+        if (filtered.length === 0 && this.state.pagination.currentPage === 1) {
+            html = this.getEmptyConversationsHTML();
+        } else {
+            html = filtered.map(conversation => this.getConversationHTML(conversation)).join('');
+            
+            // Adaugă loader la final dacă mai sunt de încărcat
+            if (this.state.pagination.hasMore) {
+                html += `
+                    <div class="load-more-container" id="loadMoreIndicator">
+                        ${this.state.pagination.isLoading ? 
+                            `<div class="loading-spinner">
+                                <div class="spinner"></div>
+                                Se încarcă mai multe conversații...
+                            </div>` : 
+                            `<div class="load-more-trigger"></div>`
+                        }
+                    </div>
+                `;
+            } else if (filtered.length > 0) {
+                // Afișează mesaj când toate conversațiile au fost încărcate
+                html += `
+                    <div class="load-more-container">
+                        <div class="text-muted text-center">
+                            <i class="fas fa-check-circle me-2"></i>
+                            Toate conversațiile au fost încărcate
+                        </div>
+                    </div>
+                `;
+            }
+        }
+        
+        this.elements.conversationsList.html(html);
+        
+        // Restaurează poziția scroll-ului dacă nu e prima încărcare
+        if (this.state.pagination.currentPage > 1) {
+            this.elements.conversationsList[0].scrollTop = scrollPosition;
+        }
+    }
+
+    async loadMoreConversations() {
+        if (this.state.pagination.isLoading || !this.state.pagination.hasMore) {
+            console.log('⏸️ Skip load more - already loading or no more data');
+            return;
+        }
+        
+        this.state.pagination.isLoading = true;
+        this.state.pagination.currentPage++;
+        
+        console.log(`📄 Încarcă pagina ${this.state.pagination.currentPage}...`);
+        
+        // Re-render pentru a arăta loader-ul
+        this.renderConversations();
+        
+        try {
+            if (window.app && typeof window.app.loadConversations === 'function') {
+                await window.app.loadConversations(false, false); // false = append, false = no loading spinner
+            }
+        } catch (error) {
+            console.error('Eroare la încărcarea mai multor conversații:', error);
+            this.state.pagination.currentPage--; // Revert page number
+        } finally {
+            this.state.pagination.isLoading = false;
+            this.renderConversations();
+        }
+    }
+
+    getFilteredConversations() {
+        let filtered = [...this.state.conversations];
+
+        if (this.state.filters.search) {
+            const search = this.state.filters.search.toLowerCase();
+            filtered = filtered.filter(conv => 
+                conv.name.toLowerCase().includes(search) ||
+                (conv.phone && conv.phone.includes(search)) ||
+                (conv.lastMessage && conv.lastMessage.toLowerCase().includes(search))
+            );
+        }
+
+        switch (this.state.filters.category) {
+            case 'unread':
+                filtered = filtered.filter(conv => conv.unreadCount > 0);
+                break;
+            case 'priority':
+                filtered = filtered.filter(conv => conv.starred || conv.priority === 'high' || conv.priority === 'urgent');
+                break;
+            case 'archived':
+                filtered = filtered.filter(conv => conv.archived);
+                break;
+        }
+
+        // Nu mai aplicăm filtrele de leadCategory și agent aici, 
+        // deoarece sunt aplicate server-side în loadConversations
+        // De asemenea, nu mai sortăm deoarece ordinea vine corectă de la server
+
+        return filtered;
+    }
+
+    getConversationHTML(conversation) {
+        const initials = Utils.getInitials(conversation.name);
+        const time = Utils.formatTime(conversation.lastActivity);
+        const preview = Utils.truncateText(conversation.lastMessage || 'Click pentru a încărca mesajele');
+        const statusKey = Utils.getLeadStatusFromValue(conversation.status);
+        
+        let priorityBadge = '';
+        if (conversation.priority === 'high' || conversation.priority === 'urgent') {
+            priorityBadge = `<div class="badge-priority priority-${conversation.priority}" title="Prioritate ${conversation.priority}"></div>`;
+        }
+        
+        let statusBadge = '';
+        if (statusKey) {
+            const statusLabel = Utils.getLeadStatusLabel(statusKey);
+            statusBadge = `<div class="badge-status status-${statusKey}" title="${statusLabel}">${statusLabel}</div>`;
+        }
+
+        let agentBadge = '';
+        if (conversation.assignedAgent) {
+            const agent = this.state.agents.find(a => a.id === conversation.assignedAgent);
+            const agentName = agent?.name || conversation.assignedAgentName || 'Agent necunoscut';
+            const normalizedConvAgentId = Utils.normalizeId(conversation.assignedAgent);
+            const normalizedCurrentUserId = Utils.normalizeId(this.state.currentUser?.id);
+            const isCurrentUser = normalizedConvAgentId === normalizedCurrentUserId;
+            const badgeClass = isCurrentUser ? 'agent-badge self' : 'agent-badge assigned';
+            const badgeText = isCurrentUser ? 'Eu' : (agent?.initials || Utils.getInitials(agentName));
+            agentBadge = `<div class="${badgeClass}" title="Atribuit către: ${agentName}">${badgeText}</div>`;
+        }
+
+        let unreadBadge = '';
+        if (conversation.unreadCount > 0) {
+            unreadBadge = `<div class="badge-unread">${conversation.unreadCount}</div>`;
+        }
+
+        const icons = [];
+        if (conversation.starred) {
+            icons.push('<i class="conversation-icon fas fa-star" title="Marcat cu stea"></i>');
+        }
+        if (conversation.archived) {
+            icons.push('<i class="conversation-icon fas fa-archive" title="Arhivat"></i>');
+        }
+        
+        let assignmentClass = '';
+        if (conversation.assignedAgent) {
+            const normalizedConvAgentId = Utils.normalizeId(conversation.assignedAgent);
+            const normalizedCurrentUserId = Utils.normalizeId(this.state.currentUser?.id);
+            assignmentClass = normalizedConvAgentId === normalizedCurrentUserId ? 
+                'conversation-self-assigned' : 'conversation-assigned';
+        }
+
+        return `
+            <div class="conversation-item ${conversation.unreadCount > 0 ? 'unread' : ''} ${assignmentClass}"
+                 data-id="${conversation.id}"
+                 data-conversation-id="${conversation.id}"
+                 data-name="${conversation.name}"
+                 data-status="${statusKey}">
+                <div class="conversation-avatar status-${statusKey}">
+                    ${initials}
+                </div>
+                <div class="conversation-content">
+                    <div class="conversation-header">
+                        <h5 class="conversation-name">${conversation.name}</h5>
+                        <span class="conversation-time">${time}</span>
+                    </div>
+                    <div class="conversation-preview">${preview}</div>
+                    <div class="conversation-meta">
+                        <div class="conversation-badges">
+                            ${statusBadge}
+                            ${agentBadge}
+                        </div>
+                        <div class="conversation-icons">
+                            ${icons.join('')}
+                            ${unreadBadge}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    async loadMessagePreviews() {
+        try {
+            console.log('📨 Încarcă preview-uri pentru mesaje...');
+            
+            const conversationIds = this.state.conversations
+                .map(conv => conv.id)
+                .filter(id => id);
+
+            if (conversationIds.length === 0) return;
+
+            const lastMessages = await APIService.loadLastMessages(conversationIds);
+    
+            let previewsUpdated = 0;
+            this.state.conversations.forEach(conv => {
+                if (lastMessages[conv.id]) {
+                    conv.lastMessage = lastMessages[conv.id].lastMessage;
+                    previewsUpdated++;
+                }
+            });
+
+            console.log(`📨 ${previewsUpdated} preview-uri actualizate`);
+    
+            this.renderConversations();
+
+        } catch (error) {
+            console.warn('Eroare la încărcarea preview-urilor:', error);
+        }
+    }
+
+    showLoadingState() {
+        if (this.elements.conversationsList) {
+            this.elements.conversationsList.html(`
+                <div class="loading-state">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Se încarcă...</span>
+                    </div>
+                    <p>Se încarcă conversațiile...</p>
+                </div>
+            `);
+        }
+    }
+
+    showMessagesLoading() {
+        if (this.elements.messagesContainer) {
+            this.elements.messagesContainer.html(`
+                <div class="loading-state">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Se încarcă...</span>
+                    </div>
+                    <p>Se încarcă mesajele...</p>
+                </div>
+            `);
+        }
+    }
+
+    showMessagesError() {
+        if (this.elements.messagesContainer) {
+            this.elements.messagesContainer.html(`
+                <div class="empty-state">
+                    <i class="fas fa-exclamation-triangle"></i>
+                    <h3>Eroare</h3>
+                    <p>Mesajele nu au putut fi încărcate.</p>
+                    <button class="btn btn-primary" onclick="location.reload()">
+                        <i class="fas fa-refresh"></i> Reîncearcă
+                    </button>
+                </div>
+            `);
+        }
+    }
+    
+    getEmptyConversationsHTML() {
+        return `
+            <div class="empty-state">
+                <i class="fas fa-comments"></i>
+                <h3>Nicio conversație</h3>
+                <p>Nu există conversații care să corespundă filtrelor aplicate.</p>
+            </div>
+        `;
+    }
+    
+    scrollToBottom() {
+        try {
+            if (this.elements.messagesContainer && 
+                this.elements.messagesContainer.length > 0 && 
+                this.elements.messagesContainer[0]) {
+                const container = this.elements.messagesContainer[0];
+                container.scrollTop = container.scrollHeight;
+            }
+        } catch (error) {
+            console.warn('Could not scroll to bottom:', error);
+        }
+    }
+
+    showNotification(title, message) {
+        const toastId = 'toast-' + Date.now();
+        const toast = document.createElement('div');
+        toast.id = toastId;
+        toast.className = 'toast-notification';
+        toast.innerHTML = `
+            <div class="toast-header">
+                <strong>${title}</strong>
+                <button type="button" class="toast-close">&times;</button>
+            </div>
+            <div class="toast-body">${message}</div>
+        `;
+        
+        let toastContainer = document.getElementById('toast-container');
+        if (!toastContainer) {
+            toastContainer = document.createElement('div');
+            toastContainer.id = 'toast-container';
+            toastContainer.className = 'toast-container';
+            document.body.appendChild(toastContainer);
+        }
+        
+        toast.querySelector('.toast-close').addEventListener('click', () => {
+            toast.remove();
+        });
+        
+        toastContainer.appendChild(toast);
+        
+        setTimeout(() => {
+            if (document.getElementById(toastId)) {
+                toast.remove();
+            }
+        }, 5000);
+    }
+
+    // FUNCȚIA CORECTATĂ PENTRU TRIMITERE MESAJE
+    async sendMessage() {
+        const messageText = this.elements.messageInput.val().trim();
+        const conversation = this.state.currentConversation;
+        if (!conversation) { alert("Nicio conversație selectată."); return; }
+
+        const phoneNumber = conversation.phone;
+        const leadId = conversation.id;
+
+        if (!CURRENT_USER || !CURRENT_USER.id) { alert("ID utilizator curent lipsă."); return; }
+        if (!phoneNumber || phoneNumber === "N/A") { 
+            alert("Număr de telefon lipsă pentru acest lead. Verificați câmpul telephone1 în Dynamics 365."); 
+            return; 
+        }
+
+        const now = new Date().getTime();
+        const twentyFourHoursInMs = 24 * 60 * 60 * 1000;
+        let isWithin24HourWindow = conversation.lastIncomingMessageTimestamp ?
+            (now - new Date(conversation.lastIncomingMessageTimestamp).getTime()) < twentyFourHoursInMs : false;
+
+        let actionType = "sendMessage";
+        let displayMessageContent = messageText;
+        let templateNameToSend = "solicitare_preluata"; // Template implicit
+        
+        // Lista de template-uri disponibile
+        const availableTemplates = [
+            { name: "solicitare_preluata", label: "Solicitare Preluată" },
+            { name: "hello_world", label: "Hello World" },
+            { name: "reminder", label: "Reminder" }
+        ];
+
+        if (!isWithin24HourWindow) {
+            actionType = "sendTemplateMessage";
+            
+            // Permite utilizatorului să aleagă template-ul
+            let templateOptions = availableTemplates.map(t => `${t.label} (${t.name})`).join('\n');
+            let selectedTemplate = prompt(`Fereastra de 24h este închisă. Selectați un template:\n\n${templateOptions}\n\nIntroduceți numele template-ului:`, templateNameToSend);
+            
+            if (!selectedTemplate) {
+                return; // Utilizatorul a anulat
+            }
+            
+            // Verifică dacă template-ul există
+            const templateExists = availableTemplates.find(t => t.name === selectedTemplate || t.label === selectedTemplate);
+            if (templateExists) {
+                templateNameToSend = templateExists.name;
+            } else {
+                templateNameToSend = selectedTemplate; // Folosește ce a introdus utilizatorul
+            }
+            
+            displayMessageContent = `[Template: ${templateNameToSend}] ${messageText}`;
+            
+            if (!confirm(`Se va trimite template-ul "${templateNameToSend}". Continuați?`)) {
+                return;
+            }
+        } else {
+            if (!messageText) return;
+        }
+
+        // Dezactivăm input-ul și butonul
+        this.elements.messageInput.prop('disabled', true);
+        this.elements.sendBtn.prop('disabled', true);
+
+        const tempMessageId = 'temp_' + Date.now();
+        const tempMessage = {
+            id: tempMessageId,
+            content: displayMessageContent,
+            timestamp: new Date().toISOString(),
+            type: 'outgoing',
+            status: 'sending',
+            sentBy: CURRENT_USER.name
+        };
+
+        if (!this.state.messages[leadId]) this.state.messages[leadId] = [];
+        this.state.messages[leadId].push(tempMessage);
+        this.renderMessages(this.state.messages[leadId]);
+        this.scrollToBottom();
+        
+        // Curățăm input-ul
+        this.elements.messageInput.val('');
+        this.autoResizeTextarea();
+        this.updateSendExperience();
+
+        try {
+            let response;
+            if (actionType === "sendMessage") {
+                // Apelăm APIService.sendMessage cu parametrii corecți
+                response = await APIService.sendMessage(leadId, messageText, phoneNumber, CURRENT_USER.id);
+            } else { // sendTemplateMessage
+                // Construiește parametrii pentru template
+                let templateParams = {};
+                
+                // Adaugă parametri specifici pentru fiecare template
+                if (templateNameToSend === "solicitare_preluata") {
+                    templateParams = {
+                        "1": conversation.name || "Client", // Nume client
+                        "2": CURRENT_USER.name || "Agent"    // Nume agent
+                    };
+                } else if (templateNameToSend === "hello_world") {
+                    templateParams = {}; // Template fără parametri
+                } else if (templateNameToSend === "reminder") {
+                    templateParams = {
+                        "1": conversation.name || "Client"
+                    };
+                }
+                
+                // Dacă există text în mesaj, îl adăugăm ca parametru adițional
+                if (messageText) {
+                    templateParams["body"] = messageText;
+                }
+                
+                console.log(`📨 Trimitere template '${templateNameToSend}' cu parametrii:`, templateParams);
+                
+                response = await APIService.sendTemplateMessage(leadId, templateNameToSend, templateParams, phoneNumber);
+            }
+
+            // Actualizăm statusul mesajului temporar
+            const messageIndex = this.state.messages[leadId].findIndex(m => m.id === tempMessageId);
+            if (messageIndex !== -1) {
+                this.state.messages[leadId][messageIndex].status = response && response.success !== false ? 'sent' : 'failed';
+            }
+            this.renderMessages(this.state.messages[leadId]);
+
+            // Actualizăm conversația
+            conversation.lastMessage = displayMessageContent;
+            conversation.lastActivity = new Date().toISOString();
+            if (conversation.archived) conversation.archived = false;
+            this.renderConversations();
+
+        } catch (error) {
+            console.error(`Eroare UI la ${actionType}:`, error);
+            const messageIndex = this.state.messages[leadId].findIndex(m => m.id === tempMessageId);
+            if (messageIndex !== -1) {
+                this.state.messages[leadId][messageIndex].status = 'failed';
+            }
+            this.renderMessages(this.state.messages[leadId]);
+        } finally {
+            // Re-activăm input-ul și butonul
+            this.elements.messageInput.prop('disabled', false);
+            this.updateSendExperience();
+        }
+    }
+
+    // METODĂ NOUĂ PENTRU TRIMITERE DIRECTĂ TEMPLATE
+    async sendTemplateMessage() {
+        const conversation = this.state.currentConversation;
+        if (!conversation) { 
+            alert("Selectați o conversație înainte de a trimite un template."); 
+            return; 
+        }
+
+        const phoneNumber = conversation.phone;
+        const leadId = conversation.id;
+
+        if (!phoneNumber || phoneNumber === "N/A") { 
+            alert("Număr de telefon lipsă pentru acest lead."); 
+            return; 
+        }
+
+        // Lista de template-uri disponibile
+        const templates = [
+            { 
+                name: "hello_world", 
+                label: "Hello World",
+                description: "Mesaj simplu de salut",
+                params: []
+            },
+            { 
+                name: "solicitare_preluata", 
+                label: "Solicitare Preluată",
+                description: "Confirmare preluare solicitare",
+                params: ["nume_client", "nume_agent"]
+            },
+            { 
+                name: "reminder", 
+                label: "Reminder",
+                description: "Mesaj de reamintire",
+                params: ["nume_client"]
+            }
+        ];
+
+        // Creează dialogul de selecție
+        let templateList = templates.map((t, i) => 
+            `${i + 1}. ${t.label} - ${t.description}`
+        ).join('\n');
+
+        const selectedIndex = prompt(
+            `Selectați un template (introduceți numărul):\n\n${templateList}`, 
+            "1"
+        );
+
+        if (!selectedIndex) return;
+
+        const templateIndex = parseInt(selectedIndex) - 1;
+        if (templateIndex < 0 || templateIndex >= templates.length) {
+            alert("Selecție invalidă.");
+            return;
+        }
+
+        const selectedTemplate = templates[templateIndex];
+        let templateParams = {};
+
+        // Solicită parametrii necesari
+        if (selectedTemplate.params.length > 0) {
+            for (let i = 0; i < selectedTemplate.params.length; i++) {
+                const paramName = selectedTemplate.params[i];
+                let defaultValue = "";
+                
+                // Valori implicite bazate pe context
+                if (paramName === "nume_client") {
+                    defaultValue = conversation.name || "Client";
+                } else if (paramName === "nume_agent") {
+                    defaultValue = CURRENT_USER?.name || "Agent";
+                }
+                
+                const value = prompt(`Parametru ${i + 1} - ${paramName}:`, defaultValue);
+                if (value === null) return; // Anulat
+                
+                templateParams[String(i + 1)] = value || defaultValue;
+            }
+        }
+
+        // Confirmă trimiterea
+        const paramsList = Object.entries(templateParams)
+            .map(([k, v]) => `  ${k}: ${v}`)
+            .join('\n');
+        
+        const confirmMessage = `Se va trimite template-ul:\n\nTemplate: ${selectedTemplate.label}\n${paramsList ? 'Parametri:\n' + paramsList : 'Fără parametri'}\n\nContinuați?`;
+        
+        if (!confirm(confirmMessage)) {
+            return;
+        }
+
+        // Trimite template-ul
+        const tempMessageId = 'temp_template_' + Date.now();
+        const tempMessage = {
+            id: tempMessageId,
+            content: `[Template: ${selectedTemplate.label}]`,
+            timestamp: new Date().toISOString(),
+            type: 'outgoing',
+            status: 'sending',
+            sentBy: CURRENT_USER.name
+        };
+
+        if (!this.state.messages[leadId]) this.state.messages[leadId] = [];
+        this.state.messages[leadId].push(tempMessage);
+        this.renderMessages(this.state.messages[leadId]);
+        this.scrollToBottom();
+
+        try {
+            console.log(`🚀 Trimitere template direct: ${selectedTemplate.name}`, templateParams);
+            
+            const response = await APIService.sendTemplateMessage(
+                leadId, 
+                selectedTemplate.name, 
+                templateParams, 
+                phoneNumber
+            );
+
+            // Actualizează statusul mesajului
+            const messageIndex = this.state.messages[leadId].findIndex(m => m.id === tempMessageId);
+            if (messageIndex !== -1) {
+                this.state.messages[leadId][messageIndex].status = response.success ? 'sent' : 'failed';
+                if (response.success) {
+                    this.state.messages[leadId][messageIndex].content = `✅ [Template: ${selectedTemplate.label}] Trimis cu succes`;
+                } else {
+                    this.state.messages[leadId][messageIndex].content = `❌ [Template: ${selectedTemplate.label}] Eroare la trimitere`;
+                }
+            }
+            this.renderMessages(this.state.messages[leadId]);
+
+            if (response.success) {
+                // Actualizează conversația
+                conversation.lastMessage = `[Template: ${selectedTemplate.label}]`;
+                conversation.lastActivity = new Date().toISOString();
+                this.renderConversations();
+                
+                this.showNotification('Succes', `Template-ul "${selectedTemplate.label}" a fost trimis cu succes.`);
+            }
+
+        } catch (error) {
+            console.error('Eroare la trimiterea template-ului:', error);
+            
+            const messageIndex = this.state.messages[leadId].findIndex(m => m.id === tempMessageId);
+            if (messageIndex !== -1) {
+                this.state.messages[leadId][messageIndex].status = 'failed';
+                this.state.messages[leadId][messageIndex].content = `❌ [Template: ${selectedTemplate.label}] ${error.message}`;
+            }
+            this.renderMessages(this.state.messages[leadId]);
+        }
+    }
+
+    destroy() {
+        if (this.refreshTimer) {
+            clearInterval(this.refreshTimer);
+        }
+    }
+}
+
+// Main Application
+class WhatsAppApp {
+    sendMessage() {
+        if (this.ui && typeof this.ui.sendMessage === 'function') {
+            this.ui.sendMessage();
+        }
+    }
+    
+    constructor() {
+        this.state = new WhatsAppState();
+        this.ui = new UIManager(this.state);
+        this.refreshTimer = null;
+        this.messagePollingTimer = null;
+        
+        this.init();
+    }
+
+    async init() {
+        try {
+            await getCurrentUser();
+            await loadAvailableAgents();
+            
+            this.state.currentUser = CURRENT_USER;
+            this.state.agents = AGENTS;
+            
+            this.ui.populateAgentDropdown();
+            this.ui.populateAgentFilterDropdown(); // Re-populează după ce avem agenții
+            
+            await this.loadConversations();
+            this.startRefreshTimer();
+            this.startMessagePolling();
+            
+            window.handleIncomingMessage = this.handleIncomingMessage.bind(this);
+            
+        } catch (error) {
+            console.error('Eroare la inițializarea aplicației:', error);
+            this.ui.elements.conversationsList.html(`
+                <div class="empty-state">
+                    <i class="fas fa-exclamation-triangle"></i>
+                    <h3>Eroare la inițializare</h3>
+                    <p>${error.message}</p>
+                    <button class="btn btn-primary" onclick="location.reload()">
+                        <i class="fas fa-refresh"></i> Reîncarcă
+                    </button>
+                </div>
+            `);
+        }
+    }
+
+    // METODA MODIFICATĂ PENTRU BACKGROUND REFRESH
+    async loadConversations(reset = true, showLoading = true) {
+        try {
+            if (reset) {
+                this.state.pagination.currentPage = 1;
+                this.state.pagination.hasMore = true;
+                this.state.pagination.totalLoaded = 0;
+                
+                // MODIFICARE: Arată loading doar dacă showLoading este true
+                if (showLoading) {
+                    this.ui.showLoadingState();
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                }
+            }
+
+            const existingCategories = new Map();
+            this.state.conversations.forEach(conv => {
+                if (conv.category) {
+                    existingCategories.set(conv.id, conv.category);
+                }
+            });
+
+            const result = await APIService.loadConversations(
+                this.state.filters.leadCategory, 
+                this.state.filters.agent,
+                this.state.pagination.currentPage,
+                this.state.pagination.pageSize
+            );
+            
+            // Pentru background refresh, fă update silențios
+            if (!showLoading && result.conversations.length > 0) {
+                // Păstrează conversația curentă selectată
+                const currentConvId = this.state.currentConversation?.id;
+                
+                // Actualizează lista fără a perturba UI-ul
+                result.conversations.forEach(conv => {
+                    if (existingCategories.has(conv.id)) {
+                        conv.category = existingCategories.get(conv.id);
+                    }
+                    if (!conv.category) {
+                        conv.category = 'standby';
+                    }
+                });
+                
+                if (reset) {
+                    this.state.conversations = result.conversations;
+                } else {
+                    const existingIds = new Set(this.state.conversations.map(c => c.id));
+                    const newConversations = result.conversations.filter(c => !existingIds.has(c.id));
+                    this.state.conversations = [...this.state.conversations, ...newConversations];
+                }
+                
+                this.state.pagination.hasMore = result.hasMore;
+                this.state.pagination.totalLoaded = this.state.conversations.length;
+                
+                // Re-renderizează doar lista, păstrând selecția
+                this.ui.renderConversations();
+                
+                // Restaurează selecția dacă există
+                if (currentConvId) {
+                    $(`.conversation-item[data-conversation-id="${currentConvId}"]`).addClass('active');
+                }
+            } else {
+                // Comportament normal când showLoading este true
+                let categoriesApplied = 0;
+                result.conversations.forEach(conv => {
+                    if (existingCategories.has(conv.id)) {
+                        conv.category = existingCategories.get(conv.id);
+                        categoriesApplied++;
+                    }
+                    if (!conv.category) {
+                        conv.category = 'standby';
+                    }
+                });
+                
+                if (reset) {
+                    this.state.conversations = result.conversations;
+                } else {
+                    const existingIds = new Set(this.state.conversations.map(c => c.id));
+                    const newConversations = result.conversations.filter(c => !existingIds.has(c.id));
+                    this.state.conversations = [...this.state.conversations, ...newConversations];
+                }
+                
+                this.state.pagination.hasMore = result.hasMore;
+                this.state.pagination.totalLoaded = this.state.conversations.length;
+                
+                this.ui.renderConversations();
+            }
+            
+            console.log(`📊 Total conversații încărcate: ${this.state.pagination.totalLoaded}, Mai sunt: ${this.state.pagination.hasMore}`);
+            
+            if (!result.hasMore && !reset) {
+                console.log('✅ Toate conversațiile au fost încărcate!');
+            }
+
+            if (this.state.conversations.length > 0 && reset && showLoading) {
+                // this.ui.loadMessagePreviews();
+            }
+        } catch (error) {
+            console.error('Eroare la încărcarea conversațiilor:', error);
+            
+            // Doar afișează eroare dacă nu e background refresh
+            if (showLoading) {
+                try {
+                    const fallbackResult = await APIService.loadConversations(
+                        this.state.filters.leadCategory,
+                        this.state.filters.agent,
+                        1,
+                        this.state.pagination.pageSize
+                    );
+                    
+                    const existingCategories = new Map();
+                    this.state.conversations.forEach(conv => {
+                        if (conv.category) {
+                            existingCategories.set(conv.id, conv.category);
+                        }
+                    });
+                    
+                    fallbackResult.conversations.forEach(conv => {
+                        if (existingCategories.has(conv.id)) {
+                            conv.category = existingCategories.get(conv.id);
+                        }
+                    });
+                    
+                    this.state.conversations = fallbackResult.conversations;
+                    this.state.pagination.hasMore = fallbackResult.hasMore;
+                    this.ui.renderConversations();
+                } catch (fallbackError) {
+                    this.ui.elements.conversationsList.html(`
+                        <div class="empty-state">
+                            <i class="fas fa-exclamation-triangle"></i>
+                            <h3>Eroare la încărcare</h3>
+                            <p>Conversațiile nu au putut fi încărcate.</p>
+                            <button class="btn btn-primary" onclick="location.reload()">
+                                <i class="fas fa-refresh"></i> Reîncearcă
+                            </button>
+                        </div>
+                    `);
+                    throw fallbackError;
+                }
+            }
+        }
+    }
+
+    async handleIncomingMessage(leadId, messageContent, timestamp) {
+        try {
+            console.log('📩 Mesaj nou primit:', { leadId, messageContent, timestamp });
+
+            let conversation = this.state.conversations.find(c => c.id === leadId);
+            
+            if (!conversation) {
+                try {
+                    console.log(`🤔 Conversația pentru lead ${leadId} nu există local. Se încarcă...`);
+                    const result = await APIService.loadConversations('all', 'all', 1, 50);
+                    const newConversation = result.conversations.find(c => c.id === leadId);
+                    
+                    if (newConversation) {
+                        conversation = newConversation;
+                        // Adaugăm la început doar dacă suntem pe prima pagină
+                        if (this.state.pagination.currentPage === 1) {
+                            this.state.conversations.unshift(conversation);
+                        }
+                        // Altfel, utilizatorul va vedea conversația când va da refresh
+                    } else {
+                        console.error(`❌ Nu s-a putut găsi conversația pentru lead-ul ${leadId}`);
+                        return;
+                    }
+                } catch (error) {
+                    console.error(`Eroare la încărcarea conversației noi pentru ${leadId}:`, error);
+                    return;
+                }
+            } else {
+                const existingCategory = conversation.category;
+                console.log(`🔄 Conversație existentă găsită: ${conversation.name}. Categorie existentă: ${existingCategory}`);
+            }
+
+            const newMessage = {
+                id: 'incoming_' + Date.now(),
+                content: messageContent,
+                timestamp: timestamp || new Date().toISOString(),
+                type: 'incoming',
+                status: 'received'
+            };
+
+            if (!this.state.messages[leadId]) {
+                this.state.messages[leadId] = [];
+            }
+            this.state.messages[leadId].push(newMessage);
+
+            if (conversation) {
+                conversation.lastMessage = messageContent;
+                conversation.lastActivity = newMessage.timestamp;
+                conversation.lastIncomingMessageTimestamp = newMessage.timestamp;
+                conversation.archived = false;
+
+                if (this.state.currentConversation?.id !== leadId || !document.hasFocus()) {
+                    conversation.unreadCount = (conversation.unreadCount || 0) + 1;
+                } else {
+                    await APIService.markMessagesAsRead(leadId);
+                }
+
+                const index = this.state.conversations.findIndex(c => c.id === leadId);
+                if (index !== -1) {
+                    this.state.conversations.splice(index, 1);
+                }
+                // Adaugăm conversația la început doar dacă suntem pe prima pagină
+                if (this.state.pagination.currentPage === 1) {
+                    this.state.conversations.unshift(conversation);
+                }
+            }
+
+            this.ui.renderConversations();
+            
+            if (this.state.currentConversation?.id === leadId) {
+                this.ui.renderMessages(this.state.messages[leadId]);
+                this.ui.scrollToBottom();
+                this.ui.updateSendExperience();
+                
+                if (conversation && conversation.unreadCount !== 0) {
+                    conversation.unreadCount = 0;
+                    this.ui.renderConversations();
+                }
+            }
+
+            if (this.state.settings.notifications && (this.state.currentConversation?.id !== leadId || !document.hasFocus())) {
+                this.showNotification(conversation?.name || 'Client nou', messageContent);
+            }
+
+            if (this.state.settings.sounds && (this.state.currentConversation?.id !== leadId || !document.hasFocus())) {
+                this.playNotificationSound();
+            }
+
+        } catch (error) {
+            console.error('Eroare la procesarea mesajului incoming:', error);
+        }
+    }
+
+    startMessagePolling() {
+        // Oprește timer-ul existent dacă există
+        if (this.messagePollingTimer) {
+            clearInterval(this.messagePollingTimer);
+        }
+        
+        // Pornește verificarea pentru mesaje noi
+        this.messagePollingTimer = setInterval(async () => {
+            await this.checkForNewMessages();
+        }, this.state.settings.messageCheckInterval || 5000);
+    }
+
+    async checkForNewMessages() {
+        try {
+            // Obține ultimul timestamp verificat
+            const lastCheck = this.state.lastMessageCheck || new Date(Date.now() - 60000).toISOString();
+            
+            // Query pentru mesaje noi
+            const newMessages = await APIService.checkForNewMessages(lastCheck);
+            
+            if (newMessages.length > 0) {
+                console.log(`📨 ${newMessages.length} mesaje noi detectate`);
+                
+                // Procesează mesajele noi
+                for (const message of newMessages) {
+                    await this.handleIncomingMessage(
+                        message["_new_leadid_value"],
+                        message.new_message,
+                        message.new_timestamp
+                    );
+                }
+            }
+            
+            // Actualizează timestamp-ul ultimei verificări
+            this.state.lastMessageCheck = new Date().toISOString();
+            
+        } catch (error) {
+            console.error('Eroare la verificarea mesajelor noi:', error);
+        }
+    }
+
+    playNotificationSound() {
+        try {
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+            
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+            
+            oscillator.frequency.value = 800;
+            gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.2);
+            
+            oscillator.start(audioContext.currentTime);
+            oscillator.stop(audioContext.currentTime + 0.2);
+        } catch (error) {
+            console.warn('Could not play notification sound:', error);
+        }
+    }
+
+    // METODA MODIFICATĂ PENTRU BACKGROUND REFRESH
+    startRefreshTimer() {
+        if (this.refreshTimer) {
+            clearInterval(this.refreshTimer);
+        }
+        
+        this.refreshTimer = setInterval(async () => {
+            try {
+                if (!this.state.currentConversation && 
+                    this.state.pagination.currentPage === 1 && 
+                    !this.state.pagination.isLoading) {
+                    console.log('🔄 Background refresh...');
+                    
+                    // MODIFICARE: Pasează false pentru showLoading
+                    await this.loadConversations(true, false);
+                }
+            } catch (error) {
+                console.warn('Eroare la refresh automat:', error);
+            }
+        }, this.state.settings.refreshInterval);
+    }
+
+    showNotification(title, message) {
+        if (this.ui && typeof this.ui.showNotification === 'function') {
+            this.ui.showNotification(title, message);
+        }
+    }
+
+    destroy() {
+        if (this.refreshTimer) {
+            clearInterval(this.refreshTimer);
+        }
+        if (this.messagePollingTimer) {
+            clearInterval(this.messagePollingTimer);
+        }
+    }
+}
+
+// Initialize application
+$(document).ready(function() {
+    try {
+        // Verifică dacă elementul lightbox există în DOM, dacă nu, creează-l
+        if ($('#imageLightbox').length === 0) {
+            $('body').append(`
+                <div id="imageLightbox" style="display: none;">
+                    <div class="lightbox-content">
+                        <button id="closeLightbox" class="lightbox-close">&times;</button>
+                        <div class="lightbox-loading">
+                            <div class="spinner-border text-light" role="status">
+                                <span class="visually-hidden">Se încarcă...</span>
+                            </div>
+                        </div>
+                        <img id="lightboxImage" class="lightbox-image" style="display: none;">
+                    </div>
+                </div>
+            `);
+        }
+
+        if ('Notification' in window && Notification.permission === 'default') {
+            Notification.requestPermission().then(permission => {
+                console.log('Notification permission:', permission);
+            });
+        }
+
+        window.app = new WhatsAppApp();
+        
+        $(window).on('beforeunload', () => {
+            if (window.app) {
+                window.app.destroy();
+            }
+        });
+        
+        console.log(`🚀 Business Messaging Dashboard cu lightbox îmbunătățit inițializat`);
+        console.log(`📌 Câmpuri utilizate: fullname pentru nume, telephone1 pentru telefon`);
+        console.log(`✅ Marcarea mesajelor ca citite este acum funcțională în Dynamics 365`);
+        console.log(`📄 Paginare activă: Se încarcă câte 20 de conversații odată`);
+        console.log(`🔄 Actualizare automată mesaje noi: verificare la fiecare ${API_CONFIG.messageCheckInterval / 1000} secunde`);
+        console.log(`🔧 Actualizare status lead: conversie automată din string în valoare numerică`);
+        console.log(`🖼️ Lightbox pentru imagini: click pe imagine pentru vizualizare fullscreen, zoom cu rotița mouse-ului`);
+        console.log(`📱 Suport mobil: scroll optimizat și pull-to-refresh activat`);
+        console.log(`🔄 Background refresh: actualizări silențioase fără loading spinner`);
+        
+    } catch (error) {
+        console.error('Eroare la inițializarea aplicației:', error);
+        $('#conversationsList').html(`
+            <div class="empty-state">
+                <i class="fas fa-exclamation-triangle"></i>
+                <h3>Eroare fatală</h3>
+                <p>Aplicația nu s-a putut inițializa</p>
+            </div>
+        `);
+    }
+});
